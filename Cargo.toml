@@ -1,0 +1,31 @@
+[package]
+name = "breadcrumb-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Signature-based file carver for disk images and block devices - Rust port of BreadCrumb's carving core"
+license = "MIT"
+repository = "https://github.com/sltcnb/breadcrumb-rs"
+keywords = ["forensics", "file-carving", "data-recovery", "disk-image", "undelete"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "breadcrumb_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bcrumb-rs"
+path = "src/main.rs"
+
+[dependencies]
+# The whole point of the port: SIMD-accelerated multi-pattern search.
+aho-corasick = "1.1"
+sha2 = "0.10"
+# Pure-Rust inflate (miniz_oxide), for the gzip handler. No C toolchain needed.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
