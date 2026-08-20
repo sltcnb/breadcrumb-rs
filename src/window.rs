@@ -136,19 +136,14 @@ pub fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let first = needle[0];
     let mut i = 0;
     while i + needle.len() <= hay.len() {
-        match hay[i..hay.len() - needle.len() + 1]
+        let off = hay[i..hay.len() - needle.len() + 1]
             .iter()
-            .position(|&b| b == first)
-        {
-            Some(off) => {
-                let at = i + off;
-                if &hay[at..at + needle.len()] == needle {
-                    return Some(at);
-                }
-                i = at + 1;
-            }
-            None => return None,
+            .position(|&b| b == first)?;
+        let at = i + off;
+        if &hay[at..at + needle.len()] == needle {
+            return Some(at);
         }
+        i = at + 1;
     }
     None
 }
