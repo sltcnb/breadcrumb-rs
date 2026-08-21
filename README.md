@@ -78,7 +78,18 @@ implementation — it remains the reference and the more complete tool:
   recovery (`--ntfs`, `--auto`, …), which recover names and timestamps
 - **BitLocker** transparent decryption
 - **Container image readers** — EWF/E01, QCOW2, VMDK, split raw, stdin spooling.
-  Only raw images and block devices are read here
+  Only raw images and block devices are read here. Handing one of those formats
+  to this tool is refused outright, by magic and by extension: carving a
+  container as raw would report fragments of its own compressed chunk data as
+  recovered files, with nothing to signal the mistake
+
+  ```
+  $ bcrumb-rs RM.E01 -o out
+  bcrumb-rs: RM.E01: this is a EWF/E01 image, which this port cannot read --
+  carving it as raw would report the container's own bytes as recovered files.
+  Use the Python implementation (https://github.com/sltcnb/BreadCrumb), which
+  reads it directly, or convert to raw first.
+  ```
 - **Deep validation** (`--validate`) and bifragment reassembly
 - **`--grep`, `--list-partitions`, custom `--sig-file` signatures**
 - **HTML/CSV/bodyfile/timeline reports** — the JSON manifest is written, the

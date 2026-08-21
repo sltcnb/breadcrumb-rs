@@ -323,6 +323,36 @@ fn truncated_input_never_overruns() {
 }
 
 #[test]
+fn container_images_are_refused_not_carved_as_raw() {
+    // An E01 read as raw carves fragments of compressed chunk data and reports
+    // them as recovered files, with nothing to signal the mistake. Refuse.
+    let dir = Tmp::new("container");
+    let cases: &[(&str, &[u8])] = &[
+        ("img.E01", b"EVF\x09\x0d\x0a\xff\x00\x01\x01\x00"),
+        ("img.Ex01", b"EVF2\x0d\x0a\x81\x00\x01\x00\x00\x00"),
+        ("img.qcow2", b"QFI\xfb\x00\x00\x00\x03\x00"),
+        ("img.vmdk", b"KDMV\x01\x00\x00\x00\x00"),
+    ];
+    for (name, magic) in cases {
+        let mut blob = magic.to_vec();
+        blob.extend_from_slice(&vec![0u8; 4096]);
+        let path = write_tmp(&dir, name, &blob);
+        let err = Reader::open(path.to_str().unwrap())
+            .err()
+            .unwrap_or_else(|| panic!("{name} was accepted as a raw image"));
+        assert!(err.to_string().contains("cannot read"), "{name}: {err}");
+    }
+
+    // An extension alone is enough, so a truncated first segment is caught too.
+    let path = write_tmp(&dir, "unreadable.e01", b"not really an ewf header");
+    assert!(Reader::open(path.to_str().unwrap()).is_err());
+
+    // ...and a plain raw image still opens.
+    let path = write_tmp(&dir, "plain.dd", &[0x41; 4096]);
+    assert!(Reader::open(path.to_str().unwrap()).is_ok());
+}
+
+#[test]
 fn type_filter_and_aliases_resolve() {
     let sigs = resolve_types("jpeg,png,webp").unwrap();
     let names: Vec<&str> = sigs.iter().map(|s| s.name).collect();

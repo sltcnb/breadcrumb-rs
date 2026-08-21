@@ -5,8 +5,49 @@
 //! code path here holds a writable handle to the source.
 
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// Container formats this port cannot read. Carving their bytes as if they
+/// were raw yields a manifest full of nonsense -- fragments of compressed
+/// chunk data -- with no sign that anything went wrong, so refuse instead.
+/// The Python implementation reads all of these.
+const CONTAINERS: &[(&[u8], &str)] = &[
+    (b"EVF\x09\x0d\x0a\xff\x00", "EWF/E01"),
+    (b"EVF2\x0d\x0a\x81\x00", "EWF2/Ex01"),
+    (b"LVF\x09\x0d\x0a\xff\x00", "EWF logical (L01)"),
+    (b"QFI\xfb", "QCOW2"),
+    (b"KDMV", "VMDK"),
+    (b"conectix", "VHD"),
+    (b"vhdxfile", "VHDX"),
+];
+
+/// Extensions that name a container even when the magic is unreadable, so a
+/// misnamed or truncated first segment is still caught.
+const CONTAINER_EXTS: &[(&str, &str)] = &[
+    (".e01", "EWF/E01"),
+    (".ex01", "EWF2/Ex01"),
+    (".s01", "EWF SMART (s01)"),
+    (".l01", "EWF logical (L01)"),
+    (".qcow2", "QCOW2"),
+    (".vmdk", "VMDK"),
+    (".vhd", "VHD"),
+    (".vhdx", "VHDX"),
+    (".aff", "AFF"),
+];
+
+fn container_kind(path: &str, head: &[u8]) -> Option<&'static str> {
+    for (magic, name) in CONTAINERS {
+        if head.starts_with(magic) {
+            return Some(name);
+        }
+    }
+    let lower = path.to_ascii_lowercase();
+    CONTAINER_EXTS
+        .iter()
+        .find(|(ext, _)| lower.ends_with(ext))
+        .map(|(_, name)| *name)
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -20,7 +61,22 @@ pub struct Reader {
 
 impl Reader {
     pub fn open(path: &str) -> io::Result<Self> {
-        let file = File::open(Path::new(path))?;
+        let mut file = File::open(Path::new(path))?;
+        let mut head = [0u8; 16];
+        let n = file.read(&mut head).unwrap_or(0);
+        file.seek(SeekFrom::Start(0))?;
+        if let Some(kind) = container_kind(path, &head[..n]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "this is a {kind} image, which this port cannot read -- \
+                     carving it as raw would report the container's own bytes \
+                     as recovered files. Use the Python implementation \
+                     (https://github.com/sltcnb/BreadCrumb), which reads it \
+                     directly, or convert to raw first."
+                ),
+            ));
+        }
         let meta = file.metadata()?;
         let (size, is_device) = if meta.is_file() {
             (meta.len(), false)
