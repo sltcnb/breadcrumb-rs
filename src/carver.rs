@@ -275,6 +275,33 @@ impl<'a> Carver<'a> {
     }
 }
 
+/// Drop carves that fall entirely inside an earlier validated carve.
+///
+/// A serial scan skips ahead past a validated carve, so it never looks inside
+/// one; parallel ranges cannot see each other's skip-ahead state, and a worker
+/// starting mid-archive would otherwise report an inner member (a file stored
+/// in a docx, say) as a separate carve. Without this, `-j` and a serial run
+/// disagree on the same image.
+pub fn containment_filter(records: Vec<Record>) -> Vec<Record> {
+    let mut sorted = records;
+    sorted.sort_by_key(|r| (r.offset, std::cmp::Reverse(r.size)));
+    let mut out: Vec<Record> = Vec::with_capacity(sorted.len());
+    let mut covered_end: u64 = 0;
+    for rec in sorted {
+        if covered_end > 0 && rec.offset + rec.size <= covered_end {
+            if !rec.path.is_empty() {
+                let _ = fs::remove_file(&rec.path);
+            }
+            continue;
+        }
+        if rec.validated {
+            covered_end = covered_end.max(rec.offset + rec.size);
+        }
+        out.push(rec);
+    }
+    out
+}
+
 /// Mark byte-identical carves as duplicates of the first one seen, dropping
 /// the redundant copies from disk.
 pub fn dedupe(records: &mut [Record], dry_run: bool) {
@@ -339,7 +366,7 @@ pub fn run_parallel(reader: &Source, sigs: &[&'static Signature], opts: &Options
             out.extend(h.join().expect("scan worker panicked"));
         }
     });
-    out.sort_by_key(|r| (r.offset, r.size));
+    let mut out = containment_filter(out);
     if opts.dedup {
         dedupe(&mut out, opts.dry_run);
     }

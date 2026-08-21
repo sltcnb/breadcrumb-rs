@@ -127,6 +127,15 @@ pub static SIGNATURES: &[Signature] = &[
         description: "OLE2/CFB: doc, xls, ppt, msg, vsd, msi",
     },
     Signature {
+        name: "pst",
+        magics: &[b"!BDN"],
+        header_offset: 0,
+        handler: handlers::carve_pst,
+        max_size: 64 * GB,
+        precheck: None,
+        description: "Outlook store (.pst/.ost)",
+    },
+    Signature {
         name: "zip",
         magics: &[b"PK\x03\x04"],
         header_offset: 0,
@@ -287,14 +296,21 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("vsd", "ole"),
     ("msi", "ole"),
     ("pub", "ole"),
+    ("msp", "ole"),
+    ("mst", "ole"),
+    ("ost", "pst"),
+    ("vsdx", "zip"),
+    ("odt", "zip"),
+    ("ods", "zip"),
 ];
 
 /// Named groups for --types, so a document sweep does not mean listing every
 /// container an Office file can arrive in.
 pub const GROUPS: &[(&str, &[&str])] = &[
     // zip covers docx/xlsx/pptx/odf; ole covers doc/xls/ppt/msg/vsd/msi.
-    ("office", &["ole", "zip", "pdf", "rtf"]),
+    ("office", &["ole", "zip", "pdf", "rtf", "pst"]),
     ("docs", &["ole", "zip", "pdf", "rtf"]),
+    ("mail", &["pst", "ole"]), // .pst/.ost stores and .msg items
     ("images", &["jpg", "png", "gif", "bmp", "tif", "ico"]),
     ("media", &["mp4", "riff", "mp3", "mkv", "ogg"]),
     ("archives", &["zip", "gz", "7z"]),

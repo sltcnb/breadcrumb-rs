@@ -418,6 +418,47 @@ const OLE_HINTS: &[(&str, &str)] = &[
     ("PowerPoint Document", "ppt"),
 ];
 
+/// Root-entry CLSIDs, the authoritative statement of what an OLE2 file is.
+/// GUID bytes are Data1/2/3 little-endian then Data4 big-endian, e.g.
+/// {00020820-0000-0000-C000-000000000046} -> 2008020000000000c000000000000046.
+const OLE_CLSIDS: &[([u8; 16], &str)] = &[
+    (hex16(0x0002_0906), "doc"), // Word 8+
+    (hex16(0x0002_0900), "doc"), // Word 6/7
+    (hex16(0x0002_0820), "xls"), // Excel Book8
+    (hex16(0x0002_0810), "xls"), // Excel Book5
+    (hex16(0x0002_1A13), "vsd"), // Visio
+    (hex16(0x0002_1A20), "vsd"),
+    (hex16(0x0002_123D), "pub"), // Publisher
+    (hex16(0x0002_0D0B), "msg"), // Outlook message
+    (hex16(0x000C_1084), "msi"), // Windows Installer
+    (hex16(0x000C_1086), "msp"), // installer patch
+    (hex16(0x000C_1082), "mst"), // installer transform
+    // PowerPoint uses a different Data2/3/4 triplet.
+    (
+        [
+            0x10, 0x8D, 0x81, 0x64, 0x9B, 0x4F, 0xCF, 0x11, 0x86, 0xEA, 0x00, 0xAA, 0x00, 0xB9,
+            0x29, 0xE8,
+        ],
+        "ppt",
+    ),
+    (
+        [
+            0x11, 0x8D, 0x81, 0x64, 0x9B, 0x4F, 0xCF, 0x11, 0x86, 0xEA, 0x00, 0xAA, 0x00, 0xB9,
+            0x29, 0xE8,
+        ],
+        "ppt",
+    ),
+];
+
+/// A {xxxxxxxx-0000-0000-C000-000000000046} CLSID, the shape Microsoft uses for
+/// most Office class ids, in on-disk byte order.
+const fn hex16(data1: u32) -> [u8; 16] {
+    let b = data1.to_le_bytes();
+    [
+        b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+    ]
+}
+
 const FREESECT: u64 = 0xFFFF_FFFF;
 const ENDOFCHAIN: u64 = 0xFFFF_FFFE;
 
@@ -495,11 +536,24 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
     if end > w.limit {
         return fallback(w);
     }
+    // The root directory entry names the application outright; stream names are
+    // the fallback for containers that leave the CLSID zeroed.
     let mut ext = "ole";
-    for (name, hint) in OLE_HINTS {
-        if w.find(&utf16le(name), 0, Some(end)).is_some() {
-            ext = hint;
-            break;
+    let dir_sect = u32le(&h, 48);
+    if dir_sect != FREESECT {
+        let root = w.read((dir_sect + 1) * sector, 128);
+        if root.len() == 128 {
+            if let Some((_, hint)) = OLE_CLSIDS.iter().find(|(id, _)| id[..] == root[80..96]) {
+                ext = hint;
+            }
+        }
+    }
+    if ext == "ole" {
+        for (name, hint) in OLE_HINTS {
+            if w.find(&utf16le(name), 0, Some(end)).is_some() {
+                ext = hint;
+                break;
+            }
         }
     }
     carve(end, ext, true)
@@ -508,6 +562,7 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
 // ------------------------------------------------------------- ZIP family
 
 const ZIP_HINTS: &[(&[u8], &str)] = &[
+    (b"visio/", "vsdx"),
     (b"word/", "docx"),
     (b"xl/", "xlsx"),
     (b"ppt/", "pptx"),
@@ -517,36 +572,116 @@ const ZIP_HINTS: &[(&[u8], &str)] = &[
     (b"mimetypeapplication/vnd.oasis.opendocument", "odf"),
 ];
 
-pub fn carve_zip(w: &mut Window) -> Option<Carve> {
+/// Follow local file headers from the archive start.
+///
+/// Returns (offset just past the last member, whether the chain stayed intact).
+/// Each member is 30 bytes of header + name + extra + compressed data, so the
+/// members can be accounted for exactly -- no searching. A zip written to a
+/// non-seekable stream defers its sizes to a data descriptor and cannot be
+/// walked, so the caller falls back to the EOCD.
+fn zip_walk_members(w: &mut Window) -> (u64, bool) {
     let mut pos: u64 = 0;
-    let mut end: Option<u64> = None;
-    let mut validated = false;
-    while let Some(eocd) = w.find(b"PK\x05\x06", pos, None) {
-        if let Some(rec) = w.exact(eocd, 22) {
-            let cd_size = u32le(&rec, 12);
-            let cd_off = u32le(&rec, 16);
-            let clen = u16le(&rec, 20);
-            let cand = eocd + 22 + clen;
-            if cand <= w.limit {
-                end = Some(cand);
-                if cd_off + cd_size == eocd {
-                    validated = true;
-                    break;
+    loop {
+        let hdr = w.read(pos, 30);
+        if hdr.len() < 30 || &hdr[..4] != b"PK\x03\x04" {
+            return (pos, true);
+        }
+        let flags = u16le(&hdr, 6);
+        let csize = u32le(&hdr, 18);
+        let name_len = u16le(&hdr, 26);
+        let extra_len = u16le(&hdr, 28);
+        if flags & 0x08 != 0 && csize == 0 {
+            return (pos, false); // streamed: size lives in the data descriptor
+        }
+        if csize == 0xFFFF_FFFF {
+            return (pos, false); // zip64: real size is in the extra field
+        }
+        let nxt = pos + 30 + name_len + extra_len + csize;
+        if nxt <= pos || nxt > w.limit {
+            return (pos, false); // runs off the end: truncated or fragmented
+        }
+        pos = nxt;
+    }
+}
+
+fn zip_ext(w: &mut Window, end: u64) -> &'static str {
+    let head = w.read(0, 4096.min(end) as usize);
+    for (needle, hint) in ZIP_HINTS {
+        if crate::window::find_sub(&head, needle).is_some() {
+            return hint;
+        }
+    }
+    "zip"
+}
+
+pub fn carve_zip(w: &mut Window) -> Option<Carve> {
+    // Walk the members, then the central directory, to the EOCD. This keeps the
+    // carve inside the archive: hunting for a trailing PK\x05\x06 finds the
+    // *next* archive's directory when this one is truncated or fragmented, and
+    // carves everything in between.
+    let (mut accounted, intact) = zip_walk_members(w);
+    if intact && accounted > 0 && w.read(accounted, 4) == b"PK\x01\x02" {
+        let mut pos = accounted;
+        while w.read(pos, 4) == b"PK\x01\x02" {
+            let ent = w.read(pos, 46);
+            if ent.len() < 46 {
+                break;
+            }
+            pos += 46 + u16le(&ent, 28) + u16le(&ent, 30) + u16le(&ent, 32);
+            if pos > w.limit {
+                pos = accounted; // directory runs off the end
+                break;
+            }
+        }
+        if w.read(pos, 4) == b"PK\x06\x06" {
+            // zip64 end of central directory
+            let rec = w.read(pos, 12);
+            if rec.len() == 12 {
+                pos += 12 + u64le(&rec, 4);
+            }
+            if w.read(pos, 4) == b"PK\x06\x07" {
+                pos += 20; // zip64 locator
+            }
+        }
+        if pos <= w.limit && w.read(pos, 4) == b"PK\x05\x06" {
+            let rec = w.read(pos, 22);
+            if rec.len() == 22 {
+                let end = pos + 22 + u16le(&rec, 20); // + archive comment
+                if end <= w.limit {
+                    let ext = zip_ext(w, end);
+                    return carve(end, ext, true);
                 }
             }
         }
-        pos = eocd + 1;
+        // Directory parsed but no EOCD behind it: keep what is accounted for.
+        accounted = accounted.max(pos).min(w.limit);
     }
-    let end = end?;
-    let head = w.read(0, 4096.min(end) as usize);
-    let mut ext = "zip";
-    for (needle, hint) in ZIP_HINTS {
-        if crate::window::find_sub(&head, needle).is_some() {
-            ext = hint;
-            break;
+
+    // Fallback: an EOCD whose central-directory arithmetic lines up with this
+    // start really is this archive's end. Anything else belongs to another.
+    let mut search = 0u64;
+    while let Some(eocd) = w.find(b"PK\x05\x06", search, None) {
+        let rec = w.read(eocd, 22);
+        if rec.len() == 22 {
+            let cd_size = u32le(&rec, 12);
+            let cd_off = u32le(&rec, 16);
+            let end = eocd + 22 + u16le(&rec, 20);
+            if cd_off + cd_size == eocd && end <= w.limit {
+                let ext = zip_ext(w, end);
+                return carve(end, ext, true);
+            }
         }
+        search = eocd + 1;
     }
-    carve(end, ext, validated)
+
+    // Nothing conclusive: carve only the bytes actually accounted for, flagged
+    // unvalidated. The data is at the front; the tail is elsewhere on disk.
+    let accounted = accounted.min(w.limit);
+    if accounted == 0 {
+        return None;
+    }
+    let ext = zip_ext(w, accounted);
+    carve(accounted, ext, false)
 }
 
 // ------------------------------------------------------------------- GZIP
@@ -1020,6 +1155,33 @@ pub fn carve_ogg(w: &mut Window) -> Option<Carve> {
         return None;
     }
     carve(last_end, "ogg", true)
+}
+
+// --------------------------------------------------------------- PST / OST
+
+/// Outlook personal folders (.pst) and offline stores (.ost).
+///
+/// The header carries the file size in ROOT.ibFileEof: 8 bytes at 0xB8 for
+/// Unicode stores, 4 bytes at 0xA8 for the older ANSI ones (MS-PST 2.2.2.6).
+/// A store whose recorded size is not plausible is still carved -- mailboxes
+/// are worth recovering truncated -- but capped and flagged unvalidated.
+pub fn carve_pst(w: &mut Window) -> Option<Carve> {
+    let h = w.read(0, 0x100);
+    if h.len() < 0x100 || &h[..4] != b"!BDN" {
+        return None;
+    }
+    if u16le(&h, 8) != 0x4D53 {
+        return None; // wMagicClient "SM"
+    }
+    let (size, floor) = match u16le(&h, 10) {
+        14 | 15 => (u32le(&h, 0xA8), 0x1000u64),   // ANSI store
+        23 | 36 | 37 => (u64le(&h, 0xB8), 0x4400), // Unicode store
+        _ => return None,
+    };
+    if size >= floor && size <= w.limit {
+        return carve(size, "pst", true);
+    }
+    carve(w.limit.min(2 << 30), "pst", false)
 }
 
 // ------------------------------------------------------- Matroska / WebM

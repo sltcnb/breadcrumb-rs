@@ -67,10 +67,10 @@ trailing-EOL over-carve, and the profile-locked MP3 frame walk.
 
 ## What is carved
 
-22 types, each with a structure-walking handler that finds the file's true end:
+23 types, each with a structure-walking handler that finds the file's true end:
 
-`jpg` `png` `gif` `bmp` `tif` `pdf` `rtf` `ole` (`doc`/`xls`/`ppt`/`msg`/`vsd`)
-`zip` (+`docx`/`xlsx`/`pptx`/`jar`/`apk`/`epub`/`odf`) `gz` `7z` `sqlite`
+`jpg` `png` `gif` `bmp` `tif` `pdf` `rtf` `ole` (`doc`/`xls`/`ppt`/`msg`/`vsd`/`pub`/`msi`)
+`pst` (`.pst`/`.ost`) `zip` (+`docx`/`xlsx`/`pptx`/`vsdx`/`jar`/`apk`/`epub`/`odf`) `gz` `7z` `sqlite`
 `mp4` (+`mov`/`heic`/`avif`/`3gp`/`m4a`/`m4v`) `riff` (`wav`/`avi`/`webp`) `mp3`
 `elf` `ico` `ogg` `mkv`/`webm` `evtx` `hive` `plist`
 
@@ -92,11 +92,18 @@ $ bcrumb-rs disk.E01 -t office -o out
 ```
 
 Legacy Office files are OLE2/CFB containers, and the extension comes from the
-stream names in the directory — `WordDocument` → `doc`, `Workbook`/`Book` →
+root entry's CLSID — the application's own statement of what it wrote — with
+the directory stream names as fallback — `WordDocument` → `doc`, `Workbook`/`Book` →
 `xls`, `PowerPoint Document` → `ppt`, `__substg1.0_*` → `msg` (Outlook),
 `VisioDocument` → `vsd` — so the carve is triageable without opening anything.
 The modern formats are ZIP containers, named from their internal paths
-(`word/` → `docx`, `xl/` → `xlsx`, `ppt/` → `pptx`).
+(`word/` → `docx`, `xl/` → `xlsx`, `ppt/` → `pptx`, `visio/` → `vsdx`).
+
+A zip's end is found by walking its local file headers, then the central
+directory, then the EOCD — never by searching forward for a trailing
+`PK\x05\x06`, which on a real disk finds the *next* archive's directory and
+carves everything in between. An archive that cannot be resolved is bounded by
+the members actually accounted for and reported unvalidated.
 
 ## Not ported
 

@@ -406,13 +406,161 @@ fn rtf_survives_escapes_and_binary_blobs() {
 }
 
 #[test]
+fn ole_root_clsid_names_the_application() {
+    // The CLSID is authoritative and outranks stream names: each container
+    // below carries a misleading WordDocument stream on purpose.
+    let dir = Tmp::new("clsid");
+    let ppt: [u8; 16] = [
+        0x10, 0x8D, 0x81, 0x64, 0x9B, 0x4F, 0xCF, 0x11, 0x86, 0xEA, 0x00, 0xAA, 0x00, 0xB9, 0x29,
+        0xE8,
+    ];
+    let office = |d1: u32| -> [u8; 16] {
+        let b = d1.to_le_bytes();
+        [
+            b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+        ]
+    };
+    for (clsid, ext) in [
+        (office(0x0002_0820), "xls"),
+        (office(0x0002_0906), "doc"),
+        (office(0x000C_1084), "msi"),
+        (office(0x0002_123D), "pub"),
+        (office(0x0002_1A13), "vsd"),
+        (ppt, "ppt"),
+    ] {
+        let data = builders::make_ole_clsid(clsid, "WordDocument");
+        let path = write_tmp(&dir, "c.bin", &data);
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
+        let mut w = window_over(&reader);
+        let carve = handlers::carve_ole(&mut w).expect("rejected");
+        assert_eq!(carve.ext, ext);
+        assert_eq!(carve.size, data.len() as u64);
+    }
+}
+
+#[test]
+fn pst_size_comes_from_the_header() {
+    let dir = Tmp::new("pst");
+    for unicode_store in [true, false] {
+        let data = builders::make_pst(unicode_store, 0x20000);
+        let mut blob = data.clone();
+        blob.extend_from_slice(&builders::Rng::new(6).bytes(4096));
+        let path = write_tmp(&dir, "store.pst", &blob);
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
+        let mut w = window_over(&reader);
+        let carve = handlers::carve_pst(&mut w).expect("pst rejected");
+        assert_eq!(carve.size, data.len() as u64, "unicode={unicode_store}");
+        assert!(carve.validated);
+    }
+
+    // An implausible recorded size must not be trusted.
+    let mut data = builders::make_pst(true, 0x20000);
+    data[0xB8..0xC0].copy_from_slice(&(1u64 << 60).to_le_bytes());
+    let path = write_tmp(&dir, "bogus.pst", &data);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    let carve = handlers::carve_pst(&mut w).expect("rejected");
+    assert!(!carve.validated);
+    assert!(carve.size <= data.len() as u64);
+}
+
+#[test]
+fn zip_carve_stays_inside_the_archive() {
+    // A fragmented archive must not be extended to a *different* archive's
+    // end-of-central-directory, swallowing everything in between.
+    let dir = Tmp::new("zipfrag");
+    let whole = builders::zip_with(b"word/document.xml", &b"content ".repeat(200));
+    let mut blob = whole[..whole.len() / 2].to_vec(); // first fragment only
+    blob.extend_from_slice(&builders::Rng::new(8).bytes(60_000)); // unrelated data
+    let tail_start = blob.len();
+    blob.extend_from_slice(&whole); // an intact archive further along
+    let path = write_tmp(&dir, "frag.img", &blob);
+
+    let records = carve_all(&path, dir.join("out"), |o| o.skip_carved = false);
+    let first = records
+        .iter()
+        .find(|r| r.offset == 0)
+        .expect("no carve at 0");
+    // The walk trusts each member's declared size, so a truncated fragment can
+    // overshoot by the bytes that are missing -- but it must never run on to
+    // the next archive, which is what searching for a trailing EOCD used to do.
+    assert!(
+        first.size <= whole.len() as u64,
+        "fragment over-carved to {} bytes, past one archive's worth",
+        first.size
+    );
+    assert!(
+        (first.size as usize) < tail_start,
+        "fragment reached the next archive"
+    );
+    assert!(
+        !first.validated,
+        "a fragment must not be reported as validated"
+    );
+    let intact = records
+        .iter()
+        .find(|r| r.offset == tail_start as u64)
+        .expect("intact archive missed");
+    assert_eq!(intact.size, whole.len() as u64);
+    assert!(intact.validated);
+}
+
+#[test]
+fn parallel_ranges_do_not_report_files_inside_a_validated_carve() {
+    // A worker starting mid-archive would otherwise carve an inner member as a
+    // separate file, so -j output would disagree with a serial run.
+    let dir = Tmp::new("containment");
+    let inner = builders::make_png();
+    let archive = builders::zip_with(b"word/media/image1.png", &inner);
+    let mut blob = vec![0u8; 512];
+    blob.extend_from_slice(&archive);
+    blob.extend_from_slice(&builders::Rng::new(12).bytes(70_000));
+    let path = write_tmp(&dir, "img.bin", &blob);
+
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let sigs: Vec<_> = SIGNATURES.iter().collect();
+    let key = |rs: &[Record]| {
+        let mut v: Vec<(u64, u64)> = rs.iter().map(|r| (r.offset, r.size)).collect();
+        v.sort();
+        v
+    };
+    let serial = {
+        let opts = Options {
+            out_dir: dir.join("s").to_string_lossy().into(),
+            quiet: true,
+            ..Options::default()
+        };
+        run_parallel(&reader, &sigs, &opts)
+    };
+    let parallel = {
+        let opts = Options {
+            out_dir: dir.join("p").to_string_lossy().into(),
+            quiet: true,
+            jobs: 4,
+            chunk_size: 1 << 12,
+            ..Options::default()
+        };
+        run_parallel(&reader, &sigs, &opts)
+    };
+    assert_eq!(
+        key(&serial),
+        key(&parallel),
+        "-j disagreed with a serial scan"
+    );
+    assert!(
+        parallel.iter().all(|r| r.offset != 512 + 30 + 21),
+        "inner png reported as its own carve"
+    );
+}
+
+#[test]
 fn office_group_resolves_to_every_document_container() {
     let names: Vec<&str> = resolve_types("office")
         .unwrap()
         .iter()
         .map(|s| s.name)
         .collect();
-    assert_eq!(names, vec!["ole", "zip", "pdf", "rtf"]);
+    assert_eq!(names, vec!["ole", "zip", "pdf", "rtf", "pst"]);
     let names: Vec<&str> = resolve_types("doc,xls,docx,pdf")
         .unwrap()
         .iter()

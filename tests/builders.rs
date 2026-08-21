@@ -400,6 +400,37 @@ pub fn make_ole(stream_name: &str) -> Vec<u8> {
     out
 }
 
+/// Outlook store header (MS-PST 2.2.2.6) padded to its recorded size. Only the
+/// fields the carver reads are filled in.
+pub fn make_pst(unicode_store: bool, size: usize) -> Vec<u8> {
+    let mut hdr = vec![0u8; if unicode_store { 0x4400 } else { 0x1000 }];
+    hdr[0..4].copy_from_slice(b"!BDN");
+    hdr[8..10].copy_from_slice(&0x4D53u16.to_le_bytes()); // wMagicClient "SM"
+    let ver: u16 = if unicode_store { 23 } else { 15 };
+    hdr[10..12].copy_from_slice(&ver.to_le_bytes());
+    hdr[12..14].copy_from_slice(&19u16.to_le_bytes()); // wVerClient
+    hdr[0x0E] = 1;
+    hdr[0x0F] = 1;
+    if unicode_store {
+        hdr[0xB8..0xC0].copy_from_slice(&(size as u64).to_le_bytes()); // ROOT.ibFileEof
+    } else {
+        hdr[0xA8..0xAC].copy_from_slice(&(size as u32).to_le_bytes());
+    }
+    hdr.resize(size, 0);
+    hdr
+}
+
+/// An OLE2 container whose root entry carries a CLSID, which is what says for
+/// certain which application wrote it.
+pub fn make_ole_clsid(clsid: [u8; 16], stream_name: &str) -> Vec<u8> {
+    let mut data = make_ole(stream_name);
+    let sector = 1usize << u16::from_le_bytes([data[30], data[31]]);
+    let dir_sect = u32::from_le_bytes([data[48], data[49], data[50], data[51]]) as usize;
+    let root = (dir_sect + 1) * sector;
+    data[root + 80..root + 96].copy_from_slice(&clsid);
+    data
+}
+
 /// RTF with a nested group, an escaped brace, and a \bin blob whose raw bytes
 /// include unbalanced braces -- all three trip a naive brace count.
 pub fn make_rtf() -> Vec<u8> {
@@ -435,5 +466,6 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("ogg", make_ogg()),
         ("doc", make_ole("WordDocument")),
         ("rtf", make_rtf()),
+        ("pst", make_pst(true, 0x8000)),
     ]
 }
