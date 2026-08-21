@@ -6,6 +6,7 @@
 //! No filesystem metadata is needed or consulted.
 
 pub mod carver;
+pub mod ewf;
 pub mod handlers;
 pub mod json;
 pub mod reader;

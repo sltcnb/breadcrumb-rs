@@ -7,7 +7,7 @@ mod builders;
 
 use breadcrumb_rs::carver::{run_parallel, Carver, Options, Record};
 use breadcrumb_rs::handlers;
-use breadcrumb_rs::reader::Reader;
+use breadcrumb_rs::reader::Source;
 use breadcrumb_rs::signatures::{resolve_types, SIGNATURES};
 use breadcrumb_rs::window::Window;
 use builders::Rng;
@@ -74,14 +74,14 @@ fn carve_all(source: &Path, out: PathBuf, tune: impl FnOnce(&mut Options)) -> Ve
         ..Options::default()
     };
     tune(&mut opts);
-    let reader = Reader::open(source.to_str().unwrap()).unwrap();
+    let reader = Source::open(source.to_str().unwrap()).unwrap();
     let sigs: Vec<_> = SIGNATURES.iter().collect();
     let mut c = Carver::new(&reader, sigs, &opts);
     c.run()
 }
 
-fn window_over<'a>(reader: &'a Reader) -> Window<'a> {
-    Window::new(reader, 0, reader.size)
+fn window_over(reader: &Source) -> Window<'_> {
+    Window::new(reader, 0, reader.size())
 }
 
 fn write_tmp(dir: &Tmp, name: &str, data: &[u8]) -> PathBuf {
@@ -190,7 +190,7 @@ fn duplicates_are_marked_and_stored_once() {
 fn parallel_scan_matches_serial() {
     let dir = Tmp::new("parallel");
     let img = planted_image(&dir);
-    let reader = Reader::open(img.path.to_str().unwrap()).unwrap();
+    let reader = Source::open(img.path.to_str().unwrap()).unwrap();
     let sigs: Vec<_> = SIGNATURES.iter().collect();
 
     let serial = {
@@ -274,7 +274,7 @@ fn pdf_takes_one_line_terminator_not_every_eol_byte() {
         blob.extend_from_slice(&tail);
         blob.extend_from_slice(&[0u8; 64]);
         let path = write_tmp(&dir, "pdf.bin", &blob);
-        let reader = Reader::open(path.to_str().unwrap()).unwrap();
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
         let mut w = window_over(&reader);
         let carve = handlers::carve_pdf(&mut w).expect("pdf rejected");
         assert_eq!(
@@ -299,7 +299,7 @@ fn mp3_frame_walk_is_profile_locked() {
     let mut blob = mp3.clone();
     blob.extend_from_slice(&other);
     let path = write_tmp(&dir, "mp3.bin", &blob);
-    let reader = Reader::open(path.to_str().unwrap()).unwrap();
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
     let mut w = window_over(&reader);
     let carve = handlers::carve_mp3(&mut w).expect("mp3 rejected");
     assert_eq!(carve.size, mp3.len() as u64);
@@ -323,33 +323,38 @@ fn truncated_input_never_overruns() {
 }
 
 #[test]
-fn container_images_are_refused_not_carved_as_raw() {
-    // An E01 read as raw carves fragments of compressed chunk data and reports
-    // them as recovered files, with nothing to signal the mistake. Refuse.
+fn unsupported_containers_are_refused_not_carved_as_raw() {
+    // Carving a container as raw reports fragments of its own compressed chunk
+    // data as recovered files, with nothing to signal the mistake. EWF is read
+    // properly (see tests/ewf.rs); everything else here must be refused.
     let dir = Tmp::new("container");
     let cases: &[(&str, &[u8])] = &[
-        ("img.E01", b"EVF\x09\x0d\x0a\xff\x00\x01\x01\x00"),
         ("img.Ex01", b"EVF2\x0d\x0a\x81\x00\x01\x00\x00\x00"),
         ("img.qcow2", b"QFI\xfb\x00\x00\x00\x03\x00"),
         ("img.vmdk", b"KDMV\x01\x00\x00\x00\x00"),
+        ("img.vhdx", b"vhdxfile\x00\x00\x00\x00"),
     ];
     for (name, magic) in cases {
         let mut blob = magic.to_vec();
         blob.extend_from_slice(&vec![0u8; 4096]);
         let path = write_tmp(&dir, name, &blob);
-        let err = Reader::open(path.to_str().unwrap())
+        let err = Source::open(path.to_str().unwrap())
             .err()
-            .unwrap_or_else(|| panic!("{name} was accepted as a raw image"));
+            .unwrap_or_else(|| panic!("{name} was accepted"));
         assert!(err.to_string().contains("cannot read"), "{name}: {err}");
     }
 
-    // An extension alone is enough, so a truncated first segment is caught too.
+    // A file named .e01 that is not an EWF image is an error too, not a raw
+    // carve of whatever it happens to contain.
     let path = write_tmp(&dir, "unreadable.e01", b"not really an ewf header");
-    assert!(Reader::open(path.to_str().unwrap()).is_err());
+    let err = Source::open(path.to_str().unwrap())
+        .err()
+        .expect("accepted");
+    assert!(err.to_string().contains("EWF"), "{err}");
 
     // ...and a plain raw image still opens.
     let path = write_tmp(&dir, "plain.dd", &[0x41; 4096]);
-    assert!(Reader::open(path.to_str().unwrap()).is_ok());
+    assert!(Source::open(path.to_str().unwrap()).is_ok());
 }
 
 #[test]

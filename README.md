@@ -9,7 +9,8 @@ A Rust port of the carving core of [BreadCrumb](https://github.com/sltcnb/BreadC
 
 ```sh
 cargo build --release
-./target/release/bcrumb-rs disk.dd -o carved -j 0
+./target/release/bcrumb-rs disk.dd  -o carved -j 0
+./target/release/bcrumb-rs disk.E01 -o carved -j 0   # EWF sets read natively
 ```
 
 ## Why a port
@@ -31,6 +32,8 @@ carve also hashes and writes 511 files.
 | scan, 1 thread | 4.35 s — 118 MiB/s | 0.60 s — 855 MiB/s | **7.2x** |
 | scan, 8 workers | 0.90 s — 570 MiB/s | 0.15 s — 3420 MiB/s | **6.0x** |
 | full carve + write, 1 thread | 4.58 s | 1.06 s | **4.3x** |
+| scan through 8-segment E01, 1 thread | 5.46 s — 94 MiB/s | 0.76 s — 674 MiB/s | **7.2x** |
+| scan through 8-segment E01, 8 workers | 1.32 s — 388 MiB/s | 0.20 s — 2602 MiB/s | **6.7x** |
 
 For reference on the same box and the same 34 magics, `ripgrep` scans that image
 at ~2050 MiB/s single-threaded — so the matcher here is in the right league, and
@@ -47,8 +50,11 @@ Both tools were run over the same images and their manifests compared on
 
 | Image | Records | Identical |
 | --- | --- | --- |
-| 513 MiB, ~500 planted files in random filler | 511 | yes |
+| 513 MiB raw, ~500 planted files in random filler | 511 | yes |
 | BreadCrumb's own `tests/make_test_image.py` output | 12 | yes |
+| the same 513 MiB as an 8-segment compressed E01 | 510 | yes |
+| 120 MiB as a 124-segment E01 set (`E01`…`EAY`) | 7268 | yes |
+| 4 MiB as a 4-segment compressed E01 | 356 | yes |
 
 That is the acceptance test for this port: if a handler here disagreed with the
 Python one by a single byte, the hashes would diverge.
@@ -77,15 +83,15 @@ implementation — it remains the reference and the more complete tool:
 - **Filesystem undelete modes** — NTFS / ext4 / FAT / HFS+ / APFS metadata
   recovery (`--ntfs`, `--auto`, …), which recover names and timestamps
 - **BitLocker** transparent decryption
-- **Container image readers** — EWF/E01, QCOW2, VMDK, split raw, stdin spooling.
-  Only raw images and block devices are read here. Handing one of those formats
-  to this tool is refused outright, by magic and by extension: carving a
-  container as raw would report fragments of its own compressed chunk data as
-  recovered files, with nothing to signal the mistake
+- **QCOW2, VMDK, VHD/VHDX, Ex01/EWF2, L01, split raw, stdin spooling.** Raw
+  images, block devices and EWF (`.E01`/`.s01`) sets are read here; the rest are
+  refused outright, by magic and by extension, because carving a container as
+  raw reports fragments of its own compressed chunk data as recovered files with
+  nothing to signal the mistake
 
   ```
-  $ bcrumb-rs RM.E01 -o out
-  bcrumb-rs: RM.E01: this is a EWF/E01 image, which this port cannot read --
+  $ bcrumb-rs disk.vmdk -o out
+  bcrumb-rs: disk.vmdk: this is a VMDK image, which this port cannot read --
   carving it as raw would report the container's own bytes as recovered files.
   Use the Python implementation (https://github.com/sltcnb/BreadCrumb), which
   reads it directly, or convert to raw first.
@@ -95,6 +101,32 @@ implementation — it remains the reference and the more complete tool:
 - **HTML/CSV/bodyfile/timeline reports** — the JSON manifest is written, the
   derived reports are not
 - Handlers for `exe`/PE, `macho`, `ole`, `rar`, `flac`, `psd`
+
+## EWF / E01
+
+`.E01` and `.s01` sets are read natively — no conversion step, no libewf:
+
+```sh
+bcrumb-rs RM.E01 -o out -j 0        # pass the FIRST segment only
+```
+
+The section list and chunk table are parsed directly, stored and
+deflate-compressed chunks are decoded on demand, and the rest of the set is
+found by name through libewf's full sequence: `E01`…`E99`, then `EAA`…`EZZ`,
+`FAA`…, through `ZZZ`. Media size comes from the volume section's sector count,
+so carve offsets match the original disk.
+
+If segments are missing, the read is refused rather than silently carving part
+of the evidence:
+
+```
+bcrumb-rs: RM.E01: incomplete EWF set: 29 segment(s) hold 899 of 3840 chunks
+(23.4% of the media). Last segment read: RM.E29 - the following segments are
+missing or misnamed.
+```
+
+Not covered: **Ex01/EWF2**, bzip2-compressed chunks, and encrypted EWF — use the
+Python implementation with `libewf-python` for those.
 
 ## Usage
 
@@ -131,7 +163,8 @@ original media.
 ## Dependencies
 
 Three, all pure Rust: `aho-corasick` (the reason this port exists), `sha2`,
-and `flate2` with the `rust_backend` feature (gzip member sizing). Parallelism
+and `flate2` with the `rust_backend` feature (gzip member sizing and EWF chunk
+decompression — no libewf needed). Parallelism
 uses `std::thread::scope`; the JSON manifest is written directly. No C toolchain
 required.
 

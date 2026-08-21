@@ -2,7 +2,7 @@
 
 use breadcrumb_rs::carver::{run_parallel, Options, Record};
 use breadcrumb_rs::json;
-use breadcrumb_rs::reader::Reader;
+use breadcrumb_rs::reader::Source;
 use breadcrumb_rs::signatures::{resolve_types, Signature, SIGNATURES};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -140,13 +140,13 @@ fn run() -> Result<ExitCode, String> {
         return Err("no signatures selected".into());
     }
 
-    let reader = Reader::open(&source).map_err(|e| format!("{source}: {e}"))?;
+    let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
     if !opts.quiet {
         eprintln!(
             "scanning {}{} ({:.1} MiB) for {} type(s), {} thread(s)",
-            reader.path,
-            if reader.is_device { " (device)" } else { "" },
-            reader.size as f64 / (1 << 20) as f64,
+            reader.path(),
+            reader.describe(),
+            reader.size() as f64 / (1 << 20) as f64,
             sigs.len(),
             opts.jobs
         );
@@ -158,7 +158,7 @@ fn run() -> Result<ExitCode, String> {
 
     let manifest_path = write_manifest(&source, &reader, &records, &opts, elapsed)?;
     if !opts.quiet {
-        let mibs = reader.size as f64 / (1 << 20) as f64 / elapsed.max(1e-9);
+        let mibs = reader.size() as f64 / (1 << 20) as f64 / elapsed.max(1e-9);
         let dups = records.iter().filter(|r| r.duplicate_of.is_some()).count();
         eprintln!(
             "carved {} file(s){} in {:.2}s ({:.0} MiB/s) -> {}",
@@ -178,7 +178,7 @@ fn run() -> Result<ExitCode, String> {
 
 fn write_manifest(
     source: &str,
-    reader: &Reader,
+    reader: &Source,
     records: &[Record],
     opts: &Options,
     elapsed: f64,
@@ -209,7 +209,7 @@ fn write_manifest(
     let manifest = json::object(vec![
         ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
         ("source", json::string(&abs)),
-        ("source_size", json::number(reader.size)),
+        ("source_size", json::number(reader.size())),
         ("elapsed_s", json::float(elapsed)),
         ("files", json::array(files)),
     ]);

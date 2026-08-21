@@ -8,12 +8,14 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Container formats this port cannot read. Carving their bytes as if they
-/// were raw yields a manifest full of nonsense -- fragments of compressed
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
+/// Container formats this port still cannot read. Carving their bytes as if
+/// they were raw yields a manifest full of nonsense -- fragments of compressed
 /// chunk data -- with no sign that anything went wrong, so refuse instead.
 /// The Python implementation reads all of these.
 const CONTAINERS: &[(&[u8], &str)] = &[
-    (b"EVF\x09\x0d\x0a\xff\x00", "EWF/E01"),
     (b"EVF2\x0d\x0a\x81\x00", "EWF2/Ex01"),
     (b"LVF\x09\x0d\x0a\xff\x00", "EWF logical (L01)"),
     (b"QFI\xfb", "QCOW2"),
@@ -25,9 +27,7 @@ const CONTAINERS: &[(&[u8], &str)] = &[
 /// Extensions that name a container even when the magic is unreadable, so a
 /// misnamed or truncated first segment is still caught.
 const CONTAINER_EXTS: &[(&str, &str)] = &[
-    (".e01", "EWF/E01"),
     (".ex01", "EWF2/Ex01"),
-    (".s01", "EWF SMART (s01)"),
     (".l01", "EWF logical (L01)"),
     (".qcow2", "QCOW2"),
     (".vmdk", "VMDK"),
@@ -35,6 +35,10 @@ const CONTAINER_EXTS: &[(&str, &str)] = &[
     (".vhdx", "VHDX"),
     (".aff", "AFF"),
 ];
+
+/// EWF (`.E01`/`.s01`) is read natively; see `ewf.rs`.
+const EWF_MAGIC: &[u8] = b"EVF\x09\x0d\x0a\xff\x00";
+const EWF_EXTS: &[&str] = &[".e01", ".s01"];
 
 fn container_kind(path: &str, head: &[u8]) -> Option<&'static str> {
     for (magic, name) in CONTAINERS {
@@ -49,8 +53,72 @@ fn container_kind(path: &str, head: &[u8]) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
+fn looks_like_ewf(path: &str, head: &[u8]) -> bool {
+    let lower = path.to_ascii_lowercase();
+    head.starts_with(EWF_MAGIC) || EWF_EXTS.iter().any(|e| lower.ends_with(e))
+}
+
+/// The image behind a scan: a raw file or device, or an EWF segment set.
+pub enum Source {
+    Raw(Reader),
+    Ewf(crate::ewf::EwfReader),
+}
+
+impl Source {
+    pub fn open(path: &str) -> io::Result<Self> {
+        let mut file = File::open(Path::new(path))?;
+        let mut head = [0u8; 16];
+        let n = file.read(&mut head).unwrap_or(0);
+        drop(file);
+        let head = &head[..n];
+        if let Some(kind) = container_kind(path, head) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "this is a {kind} image, which this port cannot read -- \
+                     carving it as raw would report the container's own bytes \
+                     as recovered files. Use the Python implementation \
+                     (https://github.com/sltcnb/BreadCrumb), which reads it \
+                     directly, or convert to raw first."
+                ),
+            ));
+        }
+        if looks_like_ewf(path, head) {
+            return Ok(Source::Ewf(crate::ewf::EwfReader::open(path)?));
+        }
+        Ok(Source::Raw(Reader::open(path)?))
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            Source::Raw(r) => r.size,
+            Source::Ewf(e) => e.size,
+        }
+    }
+
+    pub fn pread(&self, offset: u64, len: usize) -> Vec<u8> {
+        match self {
+            Source::Raw(r) => r.pread(offset, len),
+            Source::Ewf(e) => e.pread(offset, len),
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            Source::Raw(r) => &r.path,
+            Source::Ewf(e) => &e.path,
+        }
+    }
+
+    /// Short description of what was opened, for the scan banner.
+    pub fn describe(&self) -> String {
+        match self {
+            Source::Raw(r) if r.is_device => " (device)".into(),
+            Source::Raw(_) => String::new(),
+            Source::Ewf(e) => format!(" (EWF, {} segment(s))", e.segment_count()),
+        }
+    }
+}
 
 pub struct Reader {
     file: File,

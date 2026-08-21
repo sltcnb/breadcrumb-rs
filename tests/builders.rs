@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared by several test binaries; each uses a subset
+
 //! Synthetic file builders for the carve tests: one valid, minimal file per
 //! supported type, so a carve can be compared byte for byte with what was
 //! planted. Mirrors tests/builders.py in the Python implementation.

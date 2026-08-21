@@ -4,11 +4,11 @@
 //! `max_size` window into memory: reads go through 64 KiB cache blocks, so
 //! walking a box/chunk/segment list costs one read per block touched.
 
-use crate::reader::Reader;
+use crate::reader::Source;
 use std::collections::HashMap;
 
 pub struct Window<'a> {
-    reader: &'a Reader,
+    reader: &'a Source,
     pub base: u64,
     pub limit: u64,
     cache: HashMap<u64, Vec<u8>>,
@@ -19,8 +19,8 @@ const BLOCK: u64 = 1 << 16;
 const MAX_BLOCKS: usize = 64;
 
 impl<'a> Window<'a> {
-    pub fn new(reader: &'a Reader, base: u64, limit: u64) -> Self {
-        let limit = limit.min(reader.size.saturating_sub(base));
+    pub fn new(reader: &'a Source, base: u64, limit: u64) -> Self {
+        let limit = limit.min(reader.size().saturating_sub(base));
         Window {
             reader,
             base,

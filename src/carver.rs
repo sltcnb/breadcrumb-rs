@@ -5,7 +5,7 @@
 //! from one Aho-Corasick pass (SIMD prefilter) over each chunk.
 
 use crate::handlers::Carve;
-use crate::reader::Reader;
+use crate::reader::Source;
 use crate::signatures::Signature;
 use crate::window::Window;
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -77,7 +77,7 @@ impl Default for Options {
 }
 
 pub struct Carver<'a> {
-    reader: &'a Reader,
+    reader: &'a Source,
     opts: &'a Options,
     matcher: AhoCorasick,
     /// pattern index -> signatures owning that magic
@@ -89,7 +89,7 @@ pub struct Carver<'a> {
 }
 
 impl<'a> Carver<'a> {
-    pub fn new(reader: &'a Reader, sigs: Vec<&'static Signature>, opts: &'a Options) -> Self {
+    pub fn new(reader: &'a Source, sigs: Vec<&'static Signature>, opts: &'a Options) -> Self {
         // One pattern per distinct magic; longest match wins so the most
         // specific magic is preferred, matching the Python alternation order.
         let mut patterns: Vec<Vec<u8>> = Vec::new();
@@ -127,9 +127,9 @@ impl<'a> Carver<'a> {
         let o = self.opts;
         let mut records: Vec<Record> = Vec::new();
         let scan_end = if o.length > 0 {
-            (o.start + o.length).min(self.reader.size)
+            (o.start + o.length).min(self.reader.size())
         } else {
-            self.reader.size
+            self.reader.size()
         };
         self.window_end = if o.window_end > 0 {
             o.window_end
@@ -300,11 +300,11 @@ pub fn dedupe(records: &mut [Record], dry_run: bool) {
 /// Carve windows may run past a range's end (`window_end`), so a file whose
 /// header sits near a boundary is still carved whole by the worker that owns
 /// the header -- the same contract as the Python `run_parallel`.
-pub fn run_parallel(reader: &Reader, sigs: &[&'static Signature], opts: &Options) -> Vec<Record> {
+pub fn run_parallel(reader: &Source, sigs: &[&'static Signature], opts: &Options) -> Vec<Record> {
     let scan_end = if opts.length > 0 {
-        (opts.start + opts.length).min(reader.size)
+        (opts.start + opts.length).min(reader.size())
     } else {
-        reader.size
+        reader.size()
     };
     let total = scan_end.saturating_sub(opts.start);
     let jobs = opts.jobs.max(1);
