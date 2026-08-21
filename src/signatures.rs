@@ -109,6 +109,24 @@ pub static SIGNATURES: &[Signature] = &[
         description: "PDF document",
     },
     Signature {
+        name: "rtf",
+        magics: &[b"{\\rtf"],
+        header_offset: 0,
+        handler: handlers::carve_rtf,
+        max_size: 64 * MB,
+        precheck: None,
+        description: "Rich Text Format",
+    },
+    Signature {
+        name: "ole",
+        magics: &[b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"],
+        header_offset: 0,
+        handler: handlers::carve_ole,
+        max_size: 64 * MB,
+        precheck: None,
+        description: "OLE2/CFB: doc, xls, ppt, msg, vsd, msi",
+    },
+    Signature {
         name: "zip",
         magics: &[b"PK\x03\x04"],
         header_offset: 0,
@@ -262,6 +280,24 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("reg", "hive"),
     ("registry", "hive"),
     ("bplist", "plist"),
+    ("doc", "ole"),
+    ("xls", "ole"),
+    ("ppt", "ole"),
+    ("msg", "ole"),
+    ("vsd", "ole"),
+    ("msi", "ole"),
+    ("pub", "ole"),
+];
+
+/// Named groups for --types, so a document sweep does not mean listing every
+/// container an Office file can arrive in.
+pub const GROUPS: &[(&str, &[&str])] = &[
+    // zip covers docx/xlsx/pptx/odf; ole covers doc/xls/ppt/msg/vsd/msi.
+    ("office", &["ole", "zip", "pdf", "rtf"]),
+    ("docs", &["ole", "zip", "pdf", "rtf"]),
+    ("images", &["jpg", "png", "gif", "bmp", "tif", "ico"]),
+    ("media", &["mp4", "riff", "mp3", "mkv", "ogg"]),
+    ("archives", &["zip", "gz", "7z"]),
 ];
 
 /// Parse "jpg,png,..." into signature indices, erroring on unknown names.
@@ -272,18 +308,24 @@ pub fn resolve_types(spec: &str) -> Result<Vec<&'static Signature>, String> {
         if tok.is_empty() {
             continue;
         }
-        let name = ALIASES
-            .iter()
-            .find(|(a, _)| *a == tok)
-            .map(|(_, n)| *n)
-            .unwrap_or(tok.as_str());
-        match SIGNATURES.iter().find(|s| s.name == name) {
-            Some(sig) => {
-                if !out.iter().any(|s| s.name == sig.name) {
-                    out.push(sig);
+        let group = GROUPS.iter().find(|(g, _)| *g == tok).map(|(_, m)| *m);
+        let names: Vec<&str> = match group {
+            Some(members) => members.to_vec(),
+            None => vec![ALIASES
+                .iter()
+                .find(|(a, _)| *a == tok)
+                .map(|(_, n)| *n)
+                .unwrap_or(tok.as_str())],
+        };
+        for name in names {
+            match SIGNATURES.iter().find(|s| s.name == name) {
+                Some(sig) => {
+                    if !out.iter().any(|s| s.name == sig.name) {
+                        out.push(sig);
+                    }
                 }
+                None => return Err(format!("unknown type {tok:?} (see --list-types)")),
             }
-            None => return Err(format!("unknown type {tok:?} (see --list-types)")),
         }
     }
     Ok(out)

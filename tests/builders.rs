@@ -332,6 +332,88 @@ pub fn make_ogg() -> Vec<u8> {
     out
 }
 
+/// Minimal OLE2/CFB container: header + FAT + directory + one stream. Real
+/// Office 97-2003 files are exactly this shape, just larger; the stream name is
+/// what tells the handler whether it is a .doc, .xls, an Outlook .msg, and so on.
+pub fn make_ole(stream_name: &str) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    const FREESECT: u32 = 0xFFFF_FFFF;
+    const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+    const FATSECT: u32 = 0xFFFF_FFFD;
+    let payload: Vec<u8> = b"office payload ".repeat(20);
+
+    let mut hdr = vec![0u8; SECTOR];
+    hdr[0..8].copy_from_slice(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1");
+    hdr[24..26].copy_from_slice(&0x003Eu16.to_le_bytes()); // minor version
+    hdr[26..28].copy_from_slice(&3u16.to_le_bytes()); // major version
+    hdr[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes()); // little-endian
+    hdr[30..32].copy_from_slice(&9u16.to_le_bytes()); // 512-byte sectors
+    hdr[32..34].copy_from_slice(&6u16.to_le_bytes()); // mini sector shift
+    hdr[44..48].copy_from_slice(&1u32.to_le_bytes()); // FAT sector count
+    hdr[48..52].copy_from_slice(&1u32.to_le_bytes()); // first directory sector
+    hdr[56..60].copy_from_slice(&4096u32.to_le_bytes()); // mini stream cutoff
+    hdr[60..64].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    hdr[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes()); // first DIFAT
+    for i in 0..109usize {
+        let v = if i == 0 { 0u32 } else { FREESECT }; // the FAT lives at sector 0
+        hdr[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let data_sectors = payload.len().div_ceil(SECTOR).max(1);
+    let mut fat = vec![0xFFu8; SECTOR]; // all FREESECT
+    fat[0..4].copy_from_slice(&FATSECT.to_le_bytes());
+    fat[4..8].copy_from_slice(&ENDOFCHAIN.to_le_bytes()); // directory sector
+    for i in 0..data_sectors {
+        let nxt = if i + 1 < data_sectors {
+            (3 + i) as u32
+        } else {
+            ENDOFCHAIN
+        };
+        fat[8 + i * 4..12 + i * 4].copy_from_slice(&nxt.to_le_bytes());
+    }
+
+    let dir_entry = |name: &str, etype: u8, start: u32, size: u64| -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        let nb: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let n = nb.len().min(62);
+        e[..n].copy_from_slice(&nb[..n]);
+        e[64..66].copy_from_slice(&((n + 2) as u16).to_le_bytes());
+        e[66] = etype; // 5 = root, 2 = stream
+        e[67] = 1; // black
+        for o in [68usize, 72, 76] {
+            e[o..o + 4].copy_from_slice(&FREESECT.to_le_bytes());
+        }
+        e[116..120].copy_from_slice(&start.to_le_bytes());
+        e[120..128].copy_from_slice(&size.to_le_bytes());
+        e
+    };
+    let mut directory = dir_entry("Root Entry", 5, ENDOFCHAIN, 0);
+    directory.extend_from_slice(&dir_entry(stream_name, 2, 2, payload.len() as u64));
+    directory.resize(SECTOR, 0);
+
+    let mut out = hdr;
+    out.extend_from_slice(&fat);
+    out.extend_from_slice(&directory);
+    let mut body = payload;
+    body.resize(data_sectors * SECTOR, 0);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// RTF with a nested group, an escaped brace, and a \bin blob whose raw bytes
+/// include unbalanced braces -- all three trip a naive brace count.
+pub fn make_rtf() -> Vec<u8> {
+    let blob = b"}}}{{{";
+    let mut out = b"{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fnil Arial;}}\n".to_vec();
+    out.extend_from_slice(b"\\f0\\fs24 recovered \\{document\\} text\\par\n");
+    out.extend_from_slice(b"{\\*\\shppict{\\pict\\pngblip\\bin");
+    out.extend_from_slice(blob.len().to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(blob);
+    out.extend_from_slice(b"}}\n}");
+    out
+}
+
 /// Every builder, keyed by the type name the carver reports.
 pub fn all() -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -351,5 +433,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("plist", make_bplist()),
         ("7z", make_7z()),
         ("ogg", make_ogg()),
+        ("doc", make_ole("WordDocument")),
+        ("rtf", make_rtf()),
     ]
 }

@@ -67,13 +67,36 @@ trailing-EOL over-carve, and the profile-locked MP3 frame walk.
 
 ## What is carved
 
-20 types, each with a structure-walking handler that finds the file's true end:
+22 types, each with a structure-walking handler that finds the file's true end:
 
-`jpg` `png` `gif` `bmp` `tif` `pdf` `zip` (+`docx`/`xlsx`/`pptx`/`jar`/`apk`/`epub`/`odf`)
-`gz` `7z` `sqlite` `mp4` (+`mov`/`heic`/`avif`/`3gp`/`m4a`/`m4v`) `riff` (`wav`/`avi`/`webp`)
-`mp3` `elf` `ico` `ogg` `mkv`/`webm` `evtx` `hive` `plist`
+`jpg` `png` `gif` `bmp` `tif` `pdf` `rtf` `ole` (`doc`/`xls`/`ppt`/`msg`/`vsd`)
+`zip` (+`docx`/`xlsx`/`pptx`/`jar`/`apk`/`epub`/`odf`) `gz` `7z` `sqlite`
+`mp4` (+`mov`/`heic`/`avif`/`3gp`/`m4a`/`m4v`) `riff` (`wav`/`avi`/`webp`) `mp3`
+`elf` `ico` `ogg` `mkv`/`webm` `evtx` `hive` `plist`
 
-`--list-types` prints them at runtime.
+`--list-types` prints them at runtime, with the groups below.
+
+### Documents
+
+Office documents span three unrelated containers, so `-t office` takes all of
+them at once (`ole,zip,pdf,rtf`); `docs`, `images`, `media` and `archives` are
+grouped the same way.
+
+```
+$ bcrumb-rs disk.E01 -t office -o out
+  doc    at  0x1800   2048 B  high
+  rtf    at  0x2800    127 B  high
+  pdf    at  0x3200    106 B  high
+  docx   at  0x3c00    267 B  high
+  zip    at  0x4600   1249 B  high
+```
+
+Legacy Office files are OLE2/CFB containers, and the extension comes from the
+stream names in the directory — `WordDocument` → `doc`, `Workbook`/`Book` →
+`xls`, `PowerPoint Document` → `ppt`, `__substg1.0_*` → `msg` (Outlook),
+`VisioDocument` → `vsd` — so the carve is triageable without opening anything.
+The modern formats are ZIP containers, named from their internal paths
+(`word/` → `docx`, `xl/` → `xlsx`, `ppt/` → `pptx`).
 
 ## Not ported
 

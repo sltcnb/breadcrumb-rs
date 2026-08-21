@@ -87,6 +87,10 @@ fn run() -> Result<ExitCode, String> {
                 for s in SIGNATURES {
                     println!("{:<8} {}", s.name, s.description);
                 }
+                println!("\ngroups (usable in -t):");
+                for (name, members) in breadcrumb_rs::signatures::GROUPS {
+                    println!("  {:<9} {}", name, members.join(", "));
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             "-o" | "--output" => opts.out_dir = next(&mut i)?,

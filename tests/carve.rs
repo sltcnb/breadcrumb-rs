@@ -358,6 +358,70 @@ fn unsupported_containers_are_refused_not_carved_as_raw() {
 }
 
 #[test]
+fn ole_extension_comes_from_the_stream_name() {
+    // An OLE2 container is only a container; which Office application wrote it
+    // is decided by the stream names in its directory.
+    let dir = Tmp::new("ole");
+    for (stream, ext) in [
+        ("WordDocument", "doc"),
+        ("Workbook", "xls"),
+        ("Book", "xls"),
+        ("PowerPoint Document", "ppt"),
+        ("__substg1.0_0037001F", "msg"),
+        ("VisioDocument", "vsd"),
+        ("SomethingElse", "ole"),
+    ] {
+        let data = builders::make_ole(stream);
+        let mut blob = data.clone();
+        blob.extend_from_slice(&builders::Rng::new(2).bytes(2048));
+        let path = write_tmp(&dir, "ole.bin", &blob);
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
+        let mut w = window_over(&reader);
+        let carve = handlers::carve_ole(&mut w).unwrap_or_else(|| panic!("{stream} rejected"));
+        assert_eq!(carve.ext, ext, "{stream}");
+        assert_eq!(carve.size, data.len() as u64, "{stream}");
+    }
+}
+
+#[test]
+fn rtf_survives_escapes_and_binary_blobs() {
+    // Naive brace counting breaks on \{ escapes and on \binN payloads holding
+    // unbalanced braces; both appear in real documents.
+    let dir = Tmp::new("rtf");
+    let rtf = builders::make_rtf();
+    let mut blob = rtf.clone();
+    blob.extend_from_slice(&b"TRAILING JUNK".repeat(8));
+    let path = write_tmp(&dir, "doc.rtf", &blob);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    let carve = handlers::carve_rtf(&mut w).expect("rtf rejected");
+    assert_eq!(carve.size, rtf.len() as u64);
+    assert!(carve.validated);
+
+    // no closing brace: reject rather than guess a length
+    let path = write_tmp(&dir, "cut.rtf", &rtf[..rtf.len() - 1]);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    assert!(handlers::carve_rtf(&mut w).is_none());
+}
+
+#[test]
+fn office_group_resolves_to_every_document_container() {
+    let names: Vec<&str> = resolve_types("office")
+        .unwrap()
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, vec!["ole", "zip", "pdf", "rtf"]);
+    let names: Vec<&str> = resolve_types("doc,xls,docx,pdf")
+        .unwrap()
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, vec!["ole", "zip", "pdf"]);
+}
+
+#[test]
 fn type_filter_and_aliases_resolve() {
     let sigs = resolve_types("jpeg,png,webp").unwrap();
     let names: Vec<&str> = sigs.iter().map(|s| s.name).collect();

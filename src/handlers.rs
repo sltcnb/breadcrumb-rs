@@ -338,6 +338,173 @@ pub fn carve_pdf(w: &mut Window) -> Option<Carve> {
     carve(end, "pdf", true)
 }
 
+// -------------------------------------------------------------------- RTF
+
+/// RTF ends where its outermost group closes.
+///
+/// Brace counting, with two wrinkles that matter on real documents: a
+/// backslash escapes the next byte (`\{` is a literal brace), and `\binN`
+/// introduces N raw bytes that must be skipped whole -- embedded objects
+/// routinely contain unbalanced braces.
+pub fn carve_rtf(w: &mut Window) -> Option<Carve> {
+    if w.read(0, 5) != b"{\\rtf" {
+        return None;
+    }
+    let mut pos: u64 = 0;
+    let mut depth: i64 = 0;
+    while pos < w.limit {
+        let buf = w.read(pos, 1 << 16);
+        if buf.is_empty() {
+            break;
+        }
+        let mut i = 0usize;
+        let mut jumped = false;
+        while i < buf.len() {
+            match buf[i] {
+                0x5C => {
+                    // \binN<space> => skip N bytes of raw data
+                    let tail = &buf[i..(i + 24).min(buf.len())];
+                    if tail.len() > 4 && &tail[1..4] == b"bin" {
+                        let mut j = 4usize;
+                        let mut digits = String::new();
+                        while j < tail.len() && tail[j].is_ascii_digit() {
+                            digits.push(tail[j] as char);
+                            j += 1;
+                        }
+                        if let Ok(skip) = digits.parse::<u64>() {
+                            if tail.get(j) == Some(&b' ') {
+                                j += 1;
+                            }
+                            pos += i as u64 + j as u64 + skip;
+                            jumped = true;
+                            break; // re-read from the new position
+                        }
+                    }
+                    i += 2; // ordinary escape
+                }
+                0x7B => {
+                    depth += 1;
+                    i += 1;
+                }
+                0x7D => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return carve(pos + i as u64 + 1, "rtf", true);
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        if !jumped {
+            pos += buf.len() as u64;
+        }
+    }
+    None
+}
+
+// -------------------------------------------------------------- OLE2 / CFB
+
+/// Stream names that identify what an OLE2 container actually holds, as they
+/// appear in the directory: UTF-16LE. Order matters -- an .msg carries a
+/// Workbook-shaped attachment often enough that Outlook is tested first.
+const OLE_HINTS: &[(&str, &str)] = &[
+    ("__substg1.0_", "msg"),
+    ("__properties_version1.0", "msg"),
+    ("VisioDocument", "vsd"),
+    ("WordDocument", "doc"),
+    ("Workbook", "xls"),
+    ("Book", "xls"),
+    ("PowerPoint Document", "ppt"),
+];
+
+const FREESECT: u64 = 0xFFFF_FFFF;
+const ENDOFCHAIN: u64 = 0xFFFF_FFFE;
+
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+pub fn carve_ole(w: &mut Window) -> Option<Carve> {
+    let h = w.exact(0, 512)?;
+    let shift = u16le(&h, 30);
+    if shift != 9 && shift != 12 {
+        return None;
+    }
+    let sector: u64 = 1 << shift;
+    let per_sector = (sector / 4) as usize;
+
+    let fallback = |w: &Window| carve(w.limit.min(8 << 20), "ole", false);
+
+    // FAT sector locations: 109 header DIFAT entries, then the DIFAT chain.
+    let mut fat_sectors: Vec<u64> = Vec::new();
+    for i in 0..109usize {
+        let v = u32le(&h, 76 + i * 4);
+        if v != FREESECT {
+            fat_sectors.push(v);
+        }
+    }
+    let mut dif_sect = u32le(&h, 68);
+    let dif_count = u32le(&h, 72);
+    // dif_count is untrusted: bound the walk by the sectors actually available
+    // and reject cycles so a crafted chain cannot spin the loop.
+    let max_hops = (dif_count + 4).min(w.limit / sector + 1);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut hops: u64 = 0;
+    while dif_sect != ENDOFCHAIN
+        && dif_sect != FREESECT
+        && hops < max_hops
+        && !seen.contains(&dif_sect)
+    {
+        seen.push(dif_sect);
+        let blk = match w.exact((dif_sect + 1) * sector, sector as usize) {
+            Some(b) => b,
+            None => return fallback(w),
+        };
+        for i in 0..per_sector - 1 {
+            let v = u32le(&blk, i * 4);
+            if v != FREESECT {
+                fat_sectors.push(v);
+            }
+        }
+        dif_sect = u32le(&blk, (per_sector - 1) * 4);
+        hops += 1;
+    }
+    if fat_sectors.is_empty() {
+        return fallback(w);
+    }
+
+    let mut max_used: i64 = -1;
+    let mut idx_base: i64 = 0;
+    for fs in fat_sectors {
+        let blk = match w.exact((fs + 1) * sector, sector as usize) {
+            Some(b) => b,
+            None => return fallback(w),
+        };
+        for i in 0..per_sector {
+            if u32le(&blk, i * 4) != FREESECT {
+                max_used = max_used.max(idx_base + i as i64);
+            }
+        }
+        idx_base += per_sector as i64;
+    }
+    if max_used < 0 {
+        return fallback(w);
+    }
+    let end = (max_used as u64 + 2) * sector; // the header occupies "sector -1"
+    if end > w.limit {
+        return fallback(w);
+    }
+    let mut ext = "ole";
+    for (name, hint) in OLE_HINTS {
+        if w.find(&utf16le(name), 0, Some(end)).is_some() {
+            ext = hint;
+            break;
+        }
+    }
+    carve(end, ext, true)
+}
+
 // ------------------------------------------------------------- ZIP family
 
 const ZIP_HINTS: &[(&[u8], &str)] = &[
