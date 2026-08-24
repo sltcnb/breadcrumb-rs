@@ -72,6 +72,23 @@ fn recovery_password_unlocks_xts_and_diffuser_volumes() {
 }
 
 #[test]
+fn protectors_are_reported_for_key_matching() {
+    // The identifier is what a recovery-key file calls "Identification", so it
+    // is how an analyst sees a key belongs to a different volume.
+    let src = Source::open(fixture("bitlocker_xts256.dd").to_str().unwrap()).unwrap();
+    let creds = Credentials {
+        recovery: Some(RECOVERY.into()),
+        ..Default::default()
+    };
+    let mut seen = String::new();
+    let _ = src
+        .unlock_bitlocker(&creds, false, |m| seen.push_str(m))
+        .unwrap();
+    assert!(seen.contains("protector "), "{seen}");
+    assert!(seen.contains("recovery password (0x0800)"), "{seen}");
+}
+
+#[test]
 fn the_wrong_recovery_password_is_a_clean_failure() {
     let src = Source::open(fixture("bitlocker_xts256.dd").to_str().unwrap()).unwrap();
     let creds = Credentials {

@@ -226,6 +226,70 @@ fn ccm_blob_decrypt(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     crypto::ccm_decrypt(key, &blob[..12], &blob[12..], 16)
 }
 
+/// Protector name for a VMK protection type.
+pub fn protector_name(protection: u16) -> &'static str {
+    match protection {
+        PROT_CLEAR => "clear key (suspended)",
+        0x0100 => "TPM",
+        PROT_STARTUP_KEY => "startup key (.BEK)",
+        PROT_TPM_PIN => "TPM + PIN",
+        PROT_RECOVERY => "recovery password",
+        PROT_PASSWORD => "passphrase",
+        _ => "unknown",
+    }
+}
+
+/// A 16-byte mixed-endian GUID as its canonical string.
+fn guid(b: &[u8]) -> String {
+    if b.len() < 16 {
+        return String::new();
+    }
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{}",
+        b[3],
+        b[2],
+        b[1],
+        b[0],
+        b[5],
+        b[4],
+        b[7],
+        b[6],
+        b[8],
+        b[9],
+        b[10..16]
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Every AES-CCM wrapped key inside a VMK entry, and the stretch salt if there
+/// is one.
+///
+/// Windows nests the encrypted key *inside* the stretch-key entry, while some
+/// tools write the two as siblings; accept both and let the CCM MAC decide
+/// which blob (if any) the derived key opens.
+fn vmk_key_material(nested: &[Entry]) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut salt = None;
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for e in nested {
+        match e.vtype {
+            VT_AES_CCM_KEY => blobs.push(e.data.clone()),
+            VT_STRETCH_KEY if e.data.len() >= 20 => {
+                // stretch key entry: method(4) salt(16) then nested entries
+                salt = Some(e.data[4..20].to_vec());
+                for inner in walk_entries(&e.data[20..]) {
+                    if inner.vtype == VT_AES_CCM_KEY {
+                        blobs.push(inner.data);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (salt, blobs)
+}
+
 /// Turn one VMK metadata entry into the plaintext VMK, if a credential fits.
 fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
     let data = &entry.data;
@@ -234,46 +298,46 @@ fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
     }
     let protection = u16le(data, 0x1A);
     let nested = walk_entries(&data[0x1C..]);
-    let find = |vt: u16| nested.iter().find(|e| e.vtype == vt);
 
     // Clear key (suspended BitLocker): the VMK sits in the open.
     if protection == PROT_CLEAR {
-        if let Some(k) = find(VT_KEY) {
+        if let Some(k) = nested.iter().find(|e| e.vtype == VT_KEY) {
             return Some(key_from_payload(&k.data));
         }
     }
-    let stretch = find(VT_STRETCH_KEY);
-    let ccm = find(VT_AES_CCM_KEY);
 
-    // Recovery password or passphrase: stretch a salt, then CCM-unwrap.
-    if let (Some(stretch), Some(ccm)) = (stretch, ccm) {
-        if stretch.data.len() >= 20 {
-            let salt = &stretch.data[4..20];
-            let secret: Option<Vec<u8>> = match (&creds.recovery, &creds.password) {
-                (Some(r), _) if protection == PROT_RECOVERY || protection == 0 => {
-                    parse_recovery_password(r).ok()
-                }
-                (_, Some(p)) if protection == PROT_PASSWORD || protection == PROT_TPM_PIN => {
-                    Some(p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect())
-                }
-                _ => None,
-            };
-            if let Some(secret) = secret {
-                let dk = stretch_key(&password_hash(&secret), salt);
-                if let Some(payload) = ccm_blob_decrypt(&dk, &ccm.data) {
+    let (salt, blobs) = vmk_key_material(&nested);
+
+    // Recovery password or passphrase: stretch the salt, then CCM-unwrap.
+    if let Some(salt) = &salt {
+        let secret: Option<Vec<u8>> = match (&creds.recovery, &creds.password) {
+            (Some(r), _) if protection == PROT_RECOVERY || protection == 0 => {
+                parse_recovery_password(r).ok()
+            }
+            (_, Some(p)) if protection == PROT_PASSWORD || protection == PROT_TPM_PIN => {
+                Some(p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect())
+            }
+            _ => None,
+        };
+        if let Some(secret) = secret {
+            let dk = stretch_key(&password_hash(&secret), salt);
+            for blob in &blobs {
+                if let Some(payload) = ccm_blob_decrypt(&dk, blob) {
                     return Some(key_from_payload(&payload));
                 }
-                return None;
             }
+            return None;
         }
     }
 
     // Startup key (.BEK): the external key CCM-unwraps the VMK directly.
-    if let (Some(bek), Some(ccm)) = (&creds.bek, ccm) {
+    if let Some(bek) = &creds.bek {
         if protection == PROT_STARTUP_KEY {
             if let Some(ext) = external_key_from_bek(bek) {
-                if let Some(payload) = ccm_blob_decrypt(&ext, &ccm.data) {
-                    return Some(key_from_payload(&payload));
+                for blob in &blobs {
+                    if let Some(payload) = ccm_blob_decrypt(&ext, blob) {
+                        return Some(key_from_payload(&payload));
+                    }
                 }
             }
         }
@@ -297,6 +361,20 @@ fn external_key_from_bek(bek: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+impl FveMetadata {
+    /// (identifier GUID, protection type) for every VMK protector on the
+    /// volume. The identifier is what a recovery-key file calls
+    /// "Identification", so it is how an analyst tells whether the key in hand
+    /// belongs to this volume at all.
+    pub fn protectors(&self) -> Vec<(String, u16)> {
+        self.entries
+            .iter()
+            .filter(|e| e.vtype == VT_VMK && e.data.len() >= 0x1C)
+            .map(|e| (guid(&e.data[..16]), u16le(&e.data, 0x1A)))
+            .collect()
+    }
 }
 
 pub fn recover_fvek(meta: &FveMetadata, creds: &Credentials) -> Result<Vec<u8>, String> {
@@ -571,6 +649,14 @@ pub fn unlock_volume(
     if meta.is_none() && scan_metadata {
         log("bitlocker: header offsets did not resolve, scanning the volume...");
         meta = scan_for_metadata(src, base, src.size().saturating_sub(base), &mut log);
+    }
+    if let Some(m) = &meta {
+        for (id, prot) in m.protectors() {
+            log(&format!(
+                "bitlocker: protector {id} is a {} ({prot:#06x})",
+                protector_name(prot)
+            ));
+        }
     }
     let meta = meta.ok_or_else(|| {
         format!(
