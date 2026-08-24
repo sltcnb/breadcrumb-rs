@@ -67,12 +67,14 @@ trailing-EOL over-carve, and the profile-locked MP3 frame walk.
 
 ## What is carved
 
-23 types, each with a structure-walking handler that finds the file's true end:
+All 28 types the Python implementation carves, each with a structure-walking
+handler that finds the file's true end:
 
 `jpg` `png` `gif` `bmp` `tif` `pdf` `rtf` `ole` (`doc`/`xls`/`ppt`/`msg`/`vsd`/`pub`/`msi`)
 `pst` (`.pst`/`.ost`) `zip` (+`docx`/`xlsx`/`pptx`/`vsdx`/`jar`/`apk`/`epub`/`odf`) `gz` `7z` `sqlite`
 `mp4` (+`mov`/`heic`/`avif`/`3gp`/`m4a`/`m4v`) `riff` (`wav`/`avi`/`webp`) `mp3`
-`elf` `ico` `ogg` `mkv`/`webm` `evtx` `hive` `plist`
+`exe`/`dll` (PE) `elf` `macho` (thin + universal) `rar` `flac` `psd`
+`ico` `ogg` `mkv`/`webm` `evtx` `hive` `plist`
 
 `--list-types` prints them at runtime, with the groups below.
 
@@ -130,7 +132,6 @@ implementation — it remains the reference and the more complete tool:
 - **`--grep`, `--list-partitions`, custom `--sig-file` signatures**
 - **HTML/CSV/bodyfile/timeline reports** — the JSON manifest is written, the
   derived reports are not
-- Handlers for `exe`/PE, `macho`, `ole`, `rar`, `flac`, `psd`
 
 ## EWF / E01
 

@@ -445,6 +445,113 @@ pub fn make_rtf() -> Vec<u8> {
     out
 }
 
+/// Minimal thin Mach-O 64 LE with one segment and a symbol table.
+pub fn make_macho() -> Vec<u8> {
+    let (seg_fileoff, seg_filesize): (u64, u64) = (0x100, 0x200);
+    let mut cmds: Vec<u8> = Vec::new();
+    cmds.extend_from_slice(&0x19u32.to_le_bytes()); // LC_SEGMENT_64
+    cmds.extend_from_slice(&72u32.to_le_bytes());
+    let mut name = b"__TEXT".to_vec();
+    name.resize(16, 0);
+    cmds.extend_from_slice(&name);
+    cmds.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+    cmds.extend_from_slice(&0x1000u64.to_le_bytes()); // vmsize
+    cmds.extend_from_slice(&seg_fileoff.to_le_bytes());
+    cmds.extend_from_slice(&seg_filesize.to_le_bytes());
+    cmds.extend_from_slice(&7u32.to_le_bytes()); // maxprot
+    cmds.extend_from_slice(&5u32.to_le_bytes()); // initprot
+    cmds.extend_from_slice(&0u32.to_le_bytes()); // nsects
+    cmds.extend_from_slice(&0u32.to_le_bytes()); // flags
+    cmds.extend_from_slice(&0x02u32.to_le_bytes()); // LC_SYMTAB
+    cmds.extend_from_slice(&24u32.to_le_bytes());
+    cmds.extend_from_slice(&0x280u32.to_le_bytes()); // symoff
+    cmds.extend_from_slice(&4u32.to_le_bytes()); // nsyms
+    cmds.extend_from_slice(&0x2C0u32.to_le_bytes()); // stroff
+    cmds.extend_from_slice(&0x40u32.to_le_bytes()); // strsize
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&0xFEEDFACFu32.to_le_bytes()); // MH_MAGIC_64
+    out.extend_from_slice(&0x0100000Cu32.to_le_bytes()); // cputype x86_64
+    out.extend_from_slice(&0u32.to_le_bytes()); // cpusubtype
+    out.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
+    out.extend_from_slice(&2u32.to_le_bytes()); // ncmds
+    out.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    out.extend_from_slice(&cmds);
+    out.resize(0x300, 0);
+    out
+}
+
+/// Minimal PE32+ with one section and a certificate table beyond it.
+pub fn make_pe(dll: bool) -> Vec<u8> {
+    let e_lfanew: u32 = 0x80;
+    let opt_size: u16 = 240; // PE32+ optional header with 16 data directories
+    let nsections: u16 = 1;
+    let sect_raw_ptr: u32 = 0x400;
+    let sect_raw_size: u32 = 0x200;
+    let cert_off: u32 = 0x600;
+    let cert_size: u32 = 0x80;
+
+    let mut out = vec![0u8; e_lfanew as usize];
+    out[0..2].copy_from_slice(b"MZ");
+    out[60..64].copy_from_slice(&e_lfanew.to_le_bytes());
+
+    let mut pe: Vec<u8> = b"PE\x00\x00".to_vec();
+    pe.extend_from_slice(&0x8664u16.to_le_bytes()); // machine x86_64
+    pe.extend_from_slice(&nsections.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    pe.extend_from_slice(&0u32.to_le_bytes()); // symbol table
+    pe.extend_from_slice(&0u32.to_le_bytes()); // symbol count
+    pe.extend_from_slice(&opt_size.to_le_bytes());
+    let characteristics: u16 = if dll { 0x2000 } else { 0x0002 };
+    pe.extend_from_slice(&characteristics.to_le_bytes());
+
+    let mut opt = vec![0u8; opt_size as usize];
+    opt[0..2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+                                                        // data directory 4 (certificate table) lives at 112 for PE32+
+    opt[112 + 32..112 + 36].copy_from_slice(&cert_off.to_le_bytes());
+    opt[112 + 36..112 + 40].copy_from_slice(&cert_size.to_le_bytes());
+    pe.extend_from_slice(&opt);
+
+    let mut sect = vec![0u8; 40];
+    sect[..8].copy_from_slice(b".text\x00\x00\x00");
+    sect[16..20].copy_from_slice(&sect_raw_size.to_le_bytes());
+    sect[20..24].copy_from_slice(&sect_raw_ptr.to_le_bytes());
+    pe.extend_from_slice(&sect);
+
+    out.extend_from_slice(&pe);
+    out.resize((cert_off + cert_size) as usize, 0);
+    out
+}
+
+pub fn make_flac() -> Vec<u8> {
+    let mut out = b"fLaC".to_vec();
+    let streaminfo = vec![0x11u8; 34];
+    out.push(0x80); // last metadata block, type 0 (STREAMINFO)
+    out.extend_from_slice(&[0, 0, streaminfo.len() as u8]);
+    out.extend_from_slice(&streaminfo);
+    out.extend_from_slice(&[0xFF, 0xF8]); // frame sync
+    out.extend_from_slice(&Rng::new(15).bytes(200));
+    out
+}
+
+pub fn make_psd() -> Vec<u8> {
+    let mut out = b"8BPS".to_vec();
+    out.extend_from_slice(&1u16.to_be_bytes()); // version
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    out.extend_from_slice(&3u16.to_be_bytes()); // channels
+    out.extend_from_slice(&4u32.to_be_bytes()); // height
+    out.extend_from_slice(&4u32.to_be_bytes()); // width
+    out.extend_from_slice(&8u16.to_be_bytes()); // depth
+    out.extend_from_slice(&3u16.to_be_bytes()); // colour mode RGB
+    for _ in 0..4 {
+        out.extend_from_slice(&0u32.to_be_bytes()); // four empty sections
+    }
+    out.extend_from_slice(&Rng::new(16).bytes(32)); // image data
+    out
+}
+
 /// Every builder, keyed by the type name the carver reports.
 pub fn all() -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -467,5 +574,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("doc", make_ole("WordDocument")),
         ("rtf", make_rtf()),
         ("pst", make_pst(true, 0x8000)),
+        ("macho", make_macho()),
+        ("exe", make_pe(false)),
     ]
 }

@@ -31,6 +31,21 @@ fn pre_bmp(buf: &[u8], i: usize) -> bool {
     matches!(dib, 12 | 40 | 52 | 56 | 64 | 108 | 124)
 }
 
+fn pre_mz(buf: &[u8], i: usize) -> bool {
+    if i + 64 > buf.len() {
+        return true;
+    }
+    let e_lfanew =
+        u32::from_le_bytes([buf[i + 60], buf[i + 61], buf[i + 62], buf[i + 63]]) as usize;
+    if !(64..=0x10000).contains(&e_lfanew) {
+        return false;
+    }
+    if i + e_lfanew + 4 <= buf.len() {
+        return &buf[i + e_lfanew..i + e_lfanew + 4] == b"PE\x00\x00";
+    }
+    true
+}
+
 fn pre_riff(buf: &[u8], i: usize) -> bool {
     if i + 12 > buf.len() {
         return true;
@@ -199,6 +214,57 @@ pub static SIGNATURES: &[Signature] = &[
         description: "MP3 (ID3v2-tagged)",
     },
     Signature {
+        name: "rar",
+        magics: &[b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00"],
+        header_offset: 0,
+        handler: handlers::carve_rar,
+        max_size: 16 * MB,
+        precheck: None,
+        description: "RAR4/5 (capped carve, unvalidated)",
+    },
+    Signature {
+        name: "exe",
+        magics: &[b"MZ"],
+        header_offset: 0,
+        handler: handlers::carve_pe,
+        max_size: 256 * MB,
+        precheck: Some(pre_mz),
+        description: "PE (exe/dll)",
+    },
+    Signature {
+        name: "macho",
+        magics: &[
+            b"\xcf\xfa\xed\xfe",
+            b"\xce\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xcf",
+            b"\xfe\xed\xfa\xce",
+            b"\xca\xfe\xba\xbe",
+        ],
+        header_offset: 0,
+        handler: handlers::carve_macho,
+        max_size: 256 * MB,
+        precheck: None,
+        description: "Mach-O thin + universal",
+    },
+    Signature {
+        name: "flac",
+        magics: &[b"fLaC"],
+        header_offset: 0,
+        handler: handlers::carve_flac,
+        max_size: 512 * MB,
+        precheck: None,
+        description: "FLAC audio",
+    },
+    Signature {
+        name: "psd",
+        magics: &[b"8BPS"],
+        header_offset: 0,
+        handler: handlers::carve_psd,
+        max_size: 512 * MB,
+        precheck: None,
+        description: "Photoshop document",
+    },
+    Signature {
         name: "elf",
         magics: &[b"\x7fELF"],
         header_offset: 0,
@@ -302,6 +368,8 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("vsdx", "zip"),
     ("odt", "zip"),
     ("ods", "zip"),
+    ("pe", "exe"),
+    ("dll", "exe"),
 ];
 
 /// Named groups for --types, so a document sweep does not mean listing every
@@ -311,9 +379,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ("office", &["ole", "zip", "pdf", "rtf", "pst"]),
     ("docs", &["ole", "zip", "pdf", "rtf"]),
     ("mail", &["pst", "ole"]), // .pst/.ost stores and .msg items
-    ("images", &["jpg", "png", "gif", "bmp", "tif", "ico"]),
-    ("media", &["mp4", "riff", "mp3", "mkv", "ogg"]),
-    ("archives", &["zip", "gz", "7z"]),
+    ("images", &["jpg", "png", "gif", "bmp", "tif", "ico", "psd"]),
+    ("media", &["mp4", "riff", "mp3", "mkv", "ogg", "flac"]),
+    ("archives", &["zip", "gz", "7z", "rar"]),
+    ("executables", &["exe", "elf", "macho"]),
 ];
 
 /// Parse "jpg,png,..." into signature indices, erroring on unknown names.

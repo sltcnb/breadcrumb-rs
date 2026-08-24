@@ -1036,6 +1036,207 @@ pub fn carve_mp3(w: &mut Window) -> Option<Carve> {
     carve(pos, "mp3", frames > 10)
 }
 
+// ------------------------------------------------------------ PE (EXE/DLL)
+
+pub fn carve_pe(w: &mut Window) -> Option<Carve> {
+    let dos = w.exact(0, 64)?;
+    let e_lfanew = u32le(&dos, 60);
+    if !(64..=0x10000).contains(&e_lfanew) {
+        return None;
+    }
+    let pe = w.exact(e_lfanew, 24)?;
+    if &pe[..4] != b"PE\x00\x00" {
+        return None;
+    }
+    let nsections = u16le(&pe, 6);
+    let opt_size = u16le(&pe, 20);
+    if !(1..=96).contains(&nsections) || opt_size < 64 {
+        return None;
+    }
+    let opt = w.exact(e_lfanew + 24, opt_size as usize)?;
+    let magic = u16le(&opt, 0);
+    if magic != 0x10B && magic != 0x20B {
+        return None;
+    }
+    let mut end = e_lfanew + 24 + opt_size + nsections * 40;
+    let sects = w.exact(e_lfanew + 24 + opt_size, (nsections * 40) as usize)?;
+    for i in 0..nsections as usize {
+        let raw_size = u32le(&sects, i * 40 + 16);
+        let raw_ptr = u32le(&sects, i * 40 + 20);
+        if raw_ptr != 0 {
+            end = end.max(raw_ptr + raw_size);
+        }
+    }
+    // The Authenticode certificate table sits beyond the sections, and its
+    // address is a file offset rather than an RVA.
+    let dd_off = if magic == 0x10B { 96 } else { 112 };
+    if opt_size >= dd_off + 40 {
+        let cert_off = u32le(&opt, (dd_off + 32) as usize);
+        let cert_size = u32le(&opt, (dd_off + 36) as usize);
+        if cert_off != 0 && cert_size != 0 {
+            end = end.max(cert_off + cert_size);
+        }
+    }
+    if end > w.limit {
+        return None;
+    }
+    let ext = if u16le(&pe, 22) & 0x2000 != 0 {
+        "dll"
+    } else {
+        "exe"
+    };
+    carve(end, ext, true)
+}
+
+// ------------------------------------------------------------------ Mach-O
+
+/// (bits, little-endian) for each thin Mach-O magic.
+fn macho_variant(magic: &[u8]) -> Option<(u8, bool)> {
+    Some(match magic {
+        b"\xcf\xfa\xed\xfe" => (64, true),
+        b"\xce\xfa\xed\xfe" => (32, true),
+        b"\xfe\xed\xfa\xcf" => (64, false),
+        b"\xfe\xed\xfa\xce" => (32, false),
+        _ => return None,
+    })
+}
+
+fn macho_thin_size(w: &mut Window, base: u64) -> Option<u64> {
+    let h = w.exact(base, 32)?;
+    let (bits, le) = macho_variant(&h[..4])?;
+    let g32 = |b: &[u8], o: usize| if le { u32le(b, o) } else { u32be(b, o) };
+    let g64 = |b: &[u8], o: usize| if le { u64le(b, o) } else { u64be(b, o) };
+    let ncmds = g32(&h, 16);
+    let sizeofcmds = g32(&h, 20);
+    if !(1..=4096).contains(&ncmds) {
+        return None;
+    }
+    let hdr_len: u64 = if bits == 64 { 32 } else { 28 };
+    let cmds = w.exact(base + hdr_len, sizeofcmds as usize)?;
+    let mut end = hdr_len + sizeofcmds;
+    let mut pos = 0usize;
+    for _ in 0..ncmds {
+        if pos + 8 > cmds.len() {
+            return None;
+        }
+        let cmd = g32(&cmds, pos);
+        let cmdsize = g32(&cmds, pos + 4) as usize;
+        if cmdsize < 8 || pos + cmdsize > cmds.len() {
+            return None;
+        }
+        match cmd {
+            0x19 if cmdsize >= 56 => {
+                // LC_SEGMENT_64: fileoff + filesize
+                end = end.max(g64(&cmds, pos + 40) + g64(&cmds, pos + 48));
+            }
+            0x01 if cmdsize >= 40 => {
+                // LC_SEGMENT
+                end = end.max(g32(&cmds, pos + 32) + g32(&cmds, pos + 36));
+            }
+            0x02 if cmdsize >= 24 => {
+                // LC_SYMTAB: symbol table and string table
+                let nlist = if bits == 64 { 16 } else { 12 };
+                end = end.max(g32(&cmds, pos + 8) + g32(&cmds, pos + 12) * nlist);
+                end = end.max(g32(&cmds, pos + 16) + g32(&cmds, pos + 20));
+            }
+            0x1D | 0x1E | 0x26 | 0x29 | 0x2B | 0x2E | 0x2F if cmdsize >= 16 => {
+                // linkedit_data commands: dataoff + datasize
+                end = end.max(g32(&cmds, pos + 8) + g32(&cmds, pos + 12));
+            }
+            _ => {}
+        }
+        pos += cmdsize;
+    }
+    if end > hdr_len {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+pub fn carve_macho(w: &mut Window) -> Option<Carve> {
+    let h = w.exact(0, 8)?;
+    if &h[..4] == b"\xca\xfe\xba\xbe" {
+        // Fat/universal binary. A Java .class shares this magic but puts a
+        // version word where the architecture count goes, so the bound rejects it.
+        let nfat = u32be(&h, 4);
+        if !(1..=18).contains(&nfat) {
+            return None;
+        }
+        let table = w.exact(8, (nfat * 20) as usize)?;
+        let mut end = 0u64;
+        for i in 0..nfat as usize {
+            let a_off = u32be(&table, i * 20 + 8);
+            let a_size = u32be(&table, i * 20 + 12);
+            if a_off + a_size > w.limit {
+                return None;
+            }
+            macho_thin_size(w, a_off)?; // every slice must itself be Mach-O
+            end = end.max(a_off + a_size);
+        }
+        return carve(end, "macho", true);
+    }
+    let end = macho_thin_size(w, 0)?;
+    if end > w.limit {
+        return None;
+    }
+    carve(end, "macho", true)
+}
+
+// -------------------------------------------------------------------- RAR
+
+pub fn carve_rar(w: &mut Window) -> Option<Carve> {
+    // No cheap exact-size structure; carve a capped window, unvalidated.
+    if w.limit < 20 {
+        return None; // smaller than any real archive
+    }
+    carve(w.limit, "rar", false)
+}
+
+// ------------------------------------------------------------------- FLAC
+
+pub fn carve_flac(w: &mut Window) -> Option<Carve> {
+    let mut pos: u64 = 4; // past "fLaC"
+    loop {
+        let h = w.exact(pos, 4)?;
+        let last = h[0] & 0x80 != 0;
+        let block_len = ((h[1] as u64) << 16) | ((h[2] as u64) << 8) | h[3] as u64;
+        pos += 4 + block_len;
+        if last {
+            break;
+        }
+    }
+    // Frames follow with no length field: run to the next stream, or EOF.
+    match w.find(b"fLaC", pos, None) {
+        Some(nxt) if nxt > 0 => carve(nxt, "flac", true),
+        _ => carve(w.limit, "flac", false),
+    }
+}
+
+// -------------------------------------------------------------------- PSD
+
+pub fn carve_psd(w: &mut Window) -> Option<Carve> {
+    let h = w.exact(0, 26)?;
+    if &h[..4] != b"8BPS" {
+        return None;
+    }
+    let mut pos: u64 = 26;
+    // colour mode data, image resources, layer/mask info, then image data
+    for _ in 0..4 {
+        let seclen = u32be(&w.read(pos, 4), 0);
+        pos += 4 + seclen;
+        if pos > w.limit {
+            return None;
+        }
+    }
+    // The image data section carries no length; best-effort to the next file.
+    let end = match w.find(b"8BPS", pos, None) {
+        Some(nxt) if nxt > 0 => nxt,
+        _ => w.limit,
+    };
+    carve(end, "psd", false)
+}
+
 // -------------------------------------------------------------------- ELF
 
 pub fn carve_elf(w: &mut Window) -> Option<Carve> {

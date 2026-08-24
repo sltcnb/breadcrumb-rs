@@ -554,6 +554,91 @@ fn parallel_ranges_do_not_report_files_inside_a_validated_carve() {
 }
 
 #[test]
+fn pe_end_covers_sections_and_the_certificate_table() {
+    // The Authenticode certificate table sits past the last section and is
+    // addressed by file offset, so it decides the end of a signed binary.
+    let dir = Tmp::new("pe");
+    for dll in [false, true] {
+        let data = builders::make_pe(dll);
+        let mut blob = data.clone();
+        blob.extend_from_slice(&builders::Rng::new(17).bytes(4096));
+        let path = write_tmp(&dir, "bin.exe", &blob);
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
+        let mut w = window_over(&reader);
+        let carve = handlers::carve_pe(&mut w).expect("pe rejected");
+        assert_eq!(carve.size, data.len() as u64);
+        assert_eq!(carve.ext, if dll { "dll" } else { "exe" });
+        assert!(carve.validated);
+    }
+}
+
+#[test]
+fn macho_thin_and_universal_binaries_carve_exactly() {
+    let dir = Tmp::new("macho");
+    let thin = builders::make_macho();
+    let mut blob = thin.clone();
+    blob.extend_from_slice(&builders::Rng::new(18).bytes(2048));
+    let path = write_tmp(&dir, "thin.macho", &blob);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    let carve = handlers::carve_macho(&mut w).expect("thin rejected");
+    assert_eq!(carve.size, thin.len() as u64);
+    assert!(carve.validated);
+
+    // A universal binary wrapping two copies of the same slice.
+    let align = 0x1000usize;
+    let mut fat: Vec<u8> = 0xCAFEBABEu32.to_be_bytes().to_vec();
+    fat.extend_from_slice(&2u32.to_be_bytes());
+    for i in 0..2u32 {
+        fat.extend_from_slice(&0x0100000Cu32.to_be_bytes()); // cputype
+        fat.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+        fat.extend_from_slice(&((align * (i as usize + 1)) as u32).to_be_bytes());
+        fat.extend_from_slice(&(thin.len() as u32).to_be_bytes());
+        fat.extend_from_slice(&12u32.to_be_bytes()); // align
+    }
+    for i in 0..2usize {
+        fat.resize(align * (i + 1), 0);
+        fat.extend_from_slice(&thin);
+    }
+    let fat_len = fat.len();
+    fat.extend_from_slice(&builders::Rng::new(19).bytes(1024));
+    let path = write_tmp(&dir, "fat.macho", &fat);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    let carve = handlers::carve_macho(&mut w).expect("universal rejected");
+    assert_eq!(carve.size, fat_len as u64);
+    assert!(carve.validated);
+}
+
+#[test]
+fn best_effort_handlers_return_plausible_carves() {
+    // flac and psd have no end marker: they must not crash, must not reject a
+    // valid file, and must run no further than the next file or EOF.
+    let dir = Tmp::new("besteffort");
+    for (name, data) in [
+        ("flac", builders::make_flac()),
+        ("psd", builders::make_psd()),
+    ] {
+        let mut blob = data.clone();
+        blob.extend_from_slice(&builders::Rng::new(20).bytes(4096));
+        blob.extend_from_slice(&data); // a second stream further along
+        let path = write_tmp(&dir, "a.bin", &blob);
+        let reader = Source::open(path.to_str().unwrap()).unwrap();
+        let mut w = window_over(&reader);
+        let sig = SIGNATURES.iter().find(|s| s.name == name).unwrap();
+        let carve = (sig.handler)(&mut w).unwrap_or_else(|| panic!("{name} rejected"));
+        assert!(carve.size >= data.len() as u64, "{name}: truncated");
+        assert!(carve.size <= blob.len() as u64, "{name}: past the window");
+    }
+    // rar has no structure to walk at all: capped window, never validated.
+    let path = write_tmp(&dir, "a.rar", &b"Rar!\x1a\x07\x00payload".repeat(8));
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = window_over(&reader);
+    let carve = handlers::carve_rar(&mut w).expect("rar rejected");
+    assert!(!carve.validated);
+}
+
+#[test]
 fn office_group_resolves_to_every_document_container() {
     let names: Vec<&str> = resolve_types("office")
         .unwrap()
