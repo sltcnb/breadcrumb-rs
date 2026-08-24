@@ -114,7 +114,6 @@ implementation — it remains the reference and the more complete tool:
 
 - **Filesystem undelete modes** — NTFS / ext4 / FAT / HFS+ / APFS metadata
   recovery (`--ntfs`, `--auto`, …), which recover names and timestamps
-- **BitLocker** transparent decryption
 - **VHD/VHDX, Ex01/EWF2, L01, AFF.** Raw images, block devices, EWF
   (`.E01`/`.s01`) sets, QCOW2, sparse VMDK, split raw and stdin are all read
   here; what is left is refused outright, by magic and by extension, because
@@ -129,9 +128,8 @@ implementation — it remains the reference and the more complete tool:
   reads it directly, or convert to raw first.
   ```
 - **Deep validation** (`--validate`) and bifragment reassembly
-- **`--grep`, `--list-partitions`, custom `--sig-file` signatures**
-- **HTML/CSV/bodyfile/timeline reports** — the JSON manifest is written, the
-  derived reports are not
+- **Regex `--grep`** (literal patterns are supported here), custom `--sig-file`
+  signatures, and `--from-manifest`
 
 ## Image formats
 
@@ -171,6 +169,32 @@ missing or misnamed.
 
 Not covered: **Ex01/EWF2**, bzip2-compressed chunks, and encrypted EWF — use the
 Python implementation with `libewf-python` for those.
+
+## BitLocker
+
+A locked volume reads back as plaintext at the same offsets, so carving and
+`--grep` work through it unchanged:
+
+```sh
+bcrumb-rs disk.E01 -t office -o out \
+    --bitlocker-recovery-key 471806-...-635835
+```
+
+Credentials: `--bitlocker-recovery-key` (48 digits), `--bitlocker-password`,
+`--bitlocker-bek` (startup key file), or `--bitlocker-fvek` (raw key, skipping
+recovery). Suspended volumes still need one of these to be passed before the
+clear-key protector is used, matching the Python implementation.
+
+Ciphers: **AES-XTS-128/256** (the Windows 8+/10/11 default), AES-CBC-128/256,
+and AES-CBC + **Elephant diffuser** (Vista/7). Only the AES block cipher comes
+from a crate; XTS, CBC, CCM and the diffuser are implemented in `src/crypto.rs`
+so the whole decryption path reads as one file.
+
+A credential that unlocks nothing is an error, not an empty result — carving
+ciphertext and reporting "0 files" is indistinguishable from an empty disk.
+
+TPM-only protectors cannot be unlocked from an image by any tool: the key is
+sealed in hardware. Use the recovery key, a `.BEK`, or the FVEK.
 
 ## Usage
 

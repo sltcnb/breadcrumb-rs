@@ -39,6 +39,14 @@ options:
       --timeline FILE     write a timeline CSV
       --html FILE         write an HTML report
       --hash-source       hash the whole source for the manifest (custody)
+      --bitlocker-recovery-key KEY
+                          unlock BitLocker volume(s) with a 48-digit key
+      --bitlocker-password PASS
+                          unlock BitLocker with the user passphrase
+      --bitlocker-bek FILE
+                          unlock BitLocker with a startup-key .BEK file
+      --bitlocker-fvek HEX
+                          supply the raw FVEK, skipping key recovery
       --machine           JSON-lines events on stdout (for wrapping)
   -q, --quiet             no progress output
   -V, --version           print version and exit
@@ -85,6 +93,7 @@ fn run() -> Result<ExitCode, String> {
     let mut html_path: Option<String> = None;
     let mut hash_source = false;
     let mut machine = false;
+    let mut creds = breadcrumb_rs::bitlocker::Credentials::default();
     let mut i = 0;
 
     while i < argv.len() {
@@ -149,6 +158,31 @@ fn run() -> Result<ExitCode, String> {
             "--timeline" => timeline_path = Some(next(&mut i)?),
             "--html" => html_path = Some(next(&mut i)?),
             "--hash-source" => hash_source = true,
+            "--bitlocker-recovery-key" => {
+                let key = next(&mut i)?;
+                // Fail on a malformed key here rather than after a long scan.
+                breadcrumb_rs::bitlocker::parse_recovery_password(&key)
+                    .map_err(|e| format!("--bitlocker-recovery-key: {e}"))?;
+                creds.recovery = Some(key);
+            }
+            "--bitlocker-password" => creds.password = Some(next(&mut i)?),
+            "--bitlocker-bek" => {
+                let path = next(&mut i)?;
+                creds.bek = Some(
+                    std::fs::read(&path).map_err(|e| format!("--bitlocker-bek: {path}: {e}"))?,
+                );
+            }
+            "--bitlocker-fvek" => {
+                let hex = next(&mut i)?.replace([':', ' '], "");
+                if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("--bitlocker-fvek must be hex".into());
+                }
+                creds.fvek = Some(
+                    (0..hex.len() / 2)
+                        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                        .collect(),
+                );
+            }
             "--machine" => {
                 machine = true;
                 opts.quiet = true;
@@ -183,6 +217,12 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
+    let quiet = opts.quiet;
+    let reader = reader.unlock_bitlocker(&creds, |msg| {
+        if !quiet {
+            eprintln!("{msg}");
+        }
+    })?;
 
     if list_partitions {
         let parts = breadcrumb_rs::partition::parse(&reader);

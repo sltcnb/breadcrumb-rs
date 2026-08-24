@@ -1,0 +1,530 @@
+//! BitLocker (FVE) volume unlock and transparent decryption.
+//!
+//! Given a credential -- recovery password, passphrase, startup .BEK key, raw
+//! FVEK, or a suspended volume's clear key -- this parses the FVE metadata,
+//! recovers the Volume Master Key and then the Full Volume Encryption Key, and
+//! decrypts sectors on demand. Everything is read-only; no plaintext is ever
+//! written back to the source.
+//!
+//! Data ciphers: AES-XTS-128/256 (the Windows 8+ default), AES-CBC-128/256,
+//! and AES-CBC + Elephant diffuser (Vista/7).
+
+use crate::crypto::{self, Aes};
+use crate::reader::Source;
+use sha2::{Digest, Sha256};
+
+pub const FVE_SIGNATURE: &[u8] = b"-FVE-FS-";
+
+// data encryption methods (FVE metadata header)
+const M_AES_CBC_128_DIFFUSER: u32 = 0x8000;
+const M_AES_CBC_256_DIFFUSER: u32 = 0x8001;
+const M_AES_CBC_128: u32 = 0x8002;
+const M_AES_CBC_256: u32 = 0x8003;
+const M_AES_XTS_128: u32 = 0x8004;
+const M_AES_XTS_256: u32 = 0x8005;
+
+// metadata entry value types
+const VT_KEY: u16 = 0x0001;
+const VT_STRETCH_KEY: u16 = 0x0003;
+const VT_AES_CCM_KEY: u16 = 0x0005;
+const VT_VMK: u16 = 0x0008;
+const VT_EXTERNAL_KEY: u16 = 0x0009;
+// metadata entry types
+const ET_FVEK: u16 = 0x0003;
+// VMK protection types
+const PROT_CLEAR: u16 = 0x0000;
+const PROT_STARTUP_KEY: u16 = 0x0200;
+const PROT_TPM_PIN: u16 = 0x0500;
+const PROT_RECOVERY: u16 = 0x0800;
+const PROT_PASSWORD: u16 = 0x2000;
+
+const STRETCH_COUNT: u64 = 0x100000;
+
+pub fn method_name(method: u32) -> &'static str {
+    match method {
+        M_AES_CBC_128_DIFFUSER => "AES-CBC-128 + diffuser",
+        M_AES_CBC_256_DIFFUSER => "AES-CBC-256 + diffuser",
+        M_AES_CBC_128 => "AES-CBC-128",
+        M_AES_CBC_256 => "AES-CBC-256",
+        M_AES_XTS_128 => "AES-XTS-128",
+        M_AES_XTS_256 => "AES-XTS-256",
+        _ => "?",
+    }
+}
+
+fn u16le(b: &[u8], o: usize) -> u16 {
+    if o + 2 > b.len() {
+        return 0;
+    }
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+fn u32le(b: &[u8], o: usize) -> u32 {
+    if o + 4 > b.len() {
+        return 0;
+    }
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+fn u64le(b: &[u8], o: usize) -> u64 {
+    if o + 8 > b.len() {
+        return 0;
+    }
+    u64::from_le_bytes([
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
+    ])
+}
+
+#[derive(Default, Clone)]
+pub struct Credentials {
+    pub recovery: Option<String>,
+    pub password: Option<String>,
+    pub bek: Option<Vec<u8>>,
+    pub fvek: Option<Vec<u8>>,
+}
+
+impl Credentials {
+    pub fn is_empty(&self) -> bool {
+        self.recovery.is_none()
+            && self.password.is_none()
+            && self.bek.is_none()
+            && self.fvek.is_none()
+    }
+}
+
+/// 48 decimal digits (optionally dash-grouped 6x8) to the 16-byte intermediate.
+pub fn parse_recovery_password(text: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut groups: Vec<String> = cleaned
+        .split('-')
+        .filter(|g| !g.is_empty())
+        .map(|g| g.to_string())
+        .collect();
+    if groups.len() == 1 && groups[0].len() == 48 {
+        let s = groups[0].clone();
+        groups = (0..8).map(|i| s[i * 6..i * 6 + 6].to_string()).collect();
+    }
+    if groups.len() != 8
+        || groups
+            .iter()
+            .any(|g| g.len() != 6 || !g.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("recovery password must be 8 groups of 6 digits".into());
+    }
+    let mut out = Vec::with_capacity(16);
+    for g in &groups {
+        let v: u64 = g.parse().map_err(|_| format!("bad recovery group {g}"))?;
+        if v % 11 != 0 {
+            return Err(format!("recovery group {g} not divisible by 11"));
+        }
+        let v = v / 11;
+        if v > 0xFFFF {
+            return Err(format!("recovery group {g} out of range"));
+        }
+        out.extend_from_slice(&(v as u16).to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// SHA-256 applied twice: the BitLocker user/recovery key hash.
+fn password_hash(data: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(data);
+    Sha256::digest(first).into()
+}
+
+/// BitLocker key stretch: 2^20 SHA-256 rounds over an 88-byte struct of
+/// (last_hash || initial_hash || salt || counter).
+fn stretch_key(pw_hash: &[u8; 32], salt: &[u8]) -> [u8; 32] {
+    let mut last = [0u8; 32];
+    let mut buf = [0u8; 88];
+    buf[32..64].copy_from_slice(pw_hash);
+    let n = salt.len().min(16);
+    buf[64..64 + n].copy_from_slice(&salt[..n]);
+    for count in 0..STRETCH_COUNT {
+        buf[..32].copy_from_slice(&last);
+        buf[80..88].copy_from_slice(&count.to_le_bytes());
+        last = Sha256::digest(buf).into();
+    }
+    last
+}
+
+struct Entry {
+    etype: u16,
+    vtype: u16,
+    data: Vec<u8>,
+}
+
+/// Walk a metadata entry list: each entry is size(2) etype(2) vtype(2) ver(2)
+/// then its payload.
+fn walk_entries(body: &[u8]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= body.len() {
+        let size = u16le(body, pos) as usize;
+        if size < 8 || pos + size > body.len() {
+            break;
+        }
+        out.push(Entry {
+            etype: u16le(body, pos + 2),
+            vtype: u16le(body, pos + 4),
+            data: body[pos + 8..pos + size].to_vec(),
+        });
+        pos += size;
+    }
+    out
+}
+
+pub struct FveMetadata {
+    pub encryption_method: u32,
+    pub header_sectors: u32,
+    pub volume_header_offset: u64,
+    pub encrypted_volume_size: u64,
+    entries: Vec<Entry>,
+}
+
+pub fn parse_metadata(block: &[u8]) -> Result<FveMetadata, String> {
+    if block.len() < 0x70 || &block[..8] != FVE_SIGNATURE {
+        return Err("FVE metadata signature missing".into());
+    }
+    let encrypted_volume_size = u64le(block, 0x10);
+    let header_sectors = u32le(block, 0x1C);
+    let volume_header_offset = u64le(block, 0x20);
+    let metadata_size = u32le(block, 0x40) as usize;
+    let encryption_method = u32le(block, 0x40 + 0x24) & 0xFFFF;
+    let end = (0x40 + metadata_size).min(block.len());
+    if end <= 0x70 {
+        return Err("FVE metadata body empty".into());
+    }
+    Ok(FveMetadata {
+        encryption_method,
+        header_sectors,
+        volume_header_offset,
+        encrypted_volume_size,
+        entries: walk_entries(&block[0x70..end]),
+    })
+}
+
+/// A decrypted CCM "key" payload is a 4-byte header then the raw key bytes.
+fn key_from_payload(payload: &[u8]) -> Vec<u8> {
+    if payload.len() > 4 {
+        payload[4..].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// AES-CCM key entry data is nonce(12) || MAC(16) || ciphertext.
+fn ccm_blob_decrypt(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
+    if blob.len() < 12 {
+        return None;
+    }
+    crypto::ccm_decrypt(key, &blob[..12], &blob[12..], 16)
+}
+
+/// Turn one VMK metadata entry into the plaintext VMK, if a credential fits.
+fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
+    let data = &entry.data;
+    if data.len() < 0x1C {
+        return None;
+    }
+    let protection = u16le(data, 0x1A);
+    let nested = walk_entries(&data[0x1C..]);
+    let find = |vt: u16| nested.iter().find(|e| e.vtype == vt);
+
+    // Clear key (suspended BitLocker): the VMK sits in the open.
+    if protection == PROT_CLEAR {
+        if let Some(k) = find(VT_KEY) {
+            return Some(key_from_payload(&k.data));
+        }
+    }
+    let stretch = find(VT_STRETCH_KEY);
+    let ccm = find(VT_AES_CCM_KEY);
+
+    // Recovery password or passphrase: stretch a salt, then CCM-unwrap.
+    if let (Some(stretch), Some(ccm)) = (stretch, ccm) {
+        if stretch.data.len() >= 20 {
+            let salt = &stretch.data[4..20];
+            let secret: Option<Vec<u8>> = match (&creds.recovery, &creds.password) {
+                (Some(r), _) if protection == PROT_RECOVERY || protection == 0 => {
+                    parse_recovery_password(r).ok()
+                }
+                (_, Some(p)) if protection == PROT_PASSWORD || protection == PROT_TPM_PIN => {
+                    Some(p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect())
+                }
+                _ => None,
+            };
+            if let Some(secret) = secret {
+                let dk = stretch_key(&password_hash(&secret), salt);
+                if let Some(payload) = ccm_blob_decrypt(&dk, &ccm.data) {
+                    return Some(key_from_payload(&payload));
+                }
+                return None;
+            }
+        }
+    }
+
+    // Startup key (.BEK): the external key CCM-unwraps the VMK directly.
+    if let (Some(bek), Some(ccm)) = (&creds.bek, ccm) {
+        if protection == PROT_STARTUP_KEY {
+            if let Some(ext) = external_key_from_bek(bek) {
+                if let Some(payload) = ccm_blob_decrypt(&ext, &ccm.data) {
+                    return Some(key_from_payload(&payload));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A .BEK file is an FVE metadata block whose external-key entry holds a raw key.
+fn external_key_from_bek(bek: &[u8]) -> Option<Vec<u8>> {
+    let meta = parse_metadata(bek).ok()?;
+    for e in &meta.entries {
+        if e.vtype == VT_EXTERNAL_KEY && e.data.len() > 0x1C {
+            for n in walk_entries(&e.data[0x1C..]) {
+                if n.vtype == VT_KEY {
+                    return Some(key_from_payload(&n.data));
+                }
+            }
+        }
+        if e.vtype == VT_KEY {
+            return Some(key_from_payload(&e.data));
+        }
+    }
+    None
+}
+
+pub fn recover_fvek(meta: &FveMetadata, creds: &Credentials) -> Result<Vec<u8>, String> {
+    if let Some(fvek) = &creds.fvek {
+        return Ok(fvek.clone());
+    }
+    let mut vmk = None;
+    for e in &meta.entries {
+        if e.vtype == VT_VMK {
+            if let Some(k) = unlock_vmk(e, creds) {
+                vmk = Some(k);
+                break;
+            }
+        }
+    }
+    let vmk = vmk.ok_or_else(|| {
+        "no VMK could be unlocked with the supplied credential (wrong recovery \
+         key / password, or unsupported protector)"
+            .to_string()
+    })?;
+    let fvek_entry = meta
+        .entries
+        .iter()
+        .find(|e| e.etype == ET_FVEK && e.vtype == VT_AES_CCM_KEY)
+        .or_else(|| meta.entries.iter().find(|e| e.vtype == VT_AES_CCM_KEY))
+        .ok_or("no FVEK entry in metadata")?;
+    let payload = ccm_blob_decrypt(&vmk, &fvek_entry.data)
+        .ok_or("FVEK entry did not decrypt under the recovered VMK")?;
+    Ok(key_from_payload(&payload))
+}
+
+// ------------------------------------------------------------ volume cipher
+
+/// Sector-level decrypt for one FVE encryption method.
+pub struct Cipher {
+    xts: bool,
+    diffuser: bool,
+    aes1: Aes,
+    aes2: Option<Aes>,
+}
+
+impl Cipher {
+    pub fn new(method: u32, fvek: &[u8]) -> Result<Self, String> {
+        let half = match method {
+            M_AES_XTS_128 | M_AES_CBC_128_DIFFUSER => 16,
+            M_AES_XTS_256 | M_AES_CBC_256_DIFFUSER => 32,
+            M_AES_CBC_128 => 16,
+            M_AES_CBC_256 => 32,
+            _ => return Err(format!("unsupported encryption method {method:#06x}")),
+        };
+        let xts = matches!(method, M_AES_XTS_128 | M_AES_XTS_256);
+        let diffuser = matches!(method, M_AES_CBC_128_DIFFUSER | M_AES_CBC_256_DIFFUSER);
+        if fvek.len() < half {
+            return Err("FVEK too short for the declared method".into());
+        }
+        let aes1 = Aes::new(&fvek[..half]).ok_or("bad FVEK length")?;
+        let aes2 = if xts || diffuser {
+            if fvek.len() < half * 2 {
+                return Err("FVEK too short for a two-key method".into());
+            }
+            Some(Aes::new(&fvek[half..half * 2]).ok_or("bad FVEK length")?)
+        } else {
+            None
+        };
+        Ok(Cipher {
+            xts,
+            diffuser,
+            aes1,
+            aes2,
+        })
+    }
+
+    fn sector_key(&self, sector_no: u64, size: usize) -> Vec<u8> {
+        let aes2 = self.aes2.as_ref().expect("diffuser needs the second key");
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&sector_no.to_le_bytes());
+        let mut k = aes2.encrypt(&b).to_vec();
+        b[15] = 0x80;
+        k.extend_from_slice(&aes2.encrypt(&b));
+        k.iter().copied().cycle().take(size).collect()
+    }
+
+    pub fn decrypt_sector(&self, sector_no: u64, data: &[u8]) -> Vec<u8> {
+        if self.xts {
+            return crypto::xts_decrypt(
+                &self.aes1,
+                self.aes2.as_ref().expect("xts needs the tweak key"),
+                sector_no,
+                data,
+            );
+        }
+        let mut ivb = [0u8; 16];
+        ivb[..8].copy_from_slice(&sector_no.to_le_bytes());
+        let iv = self.aes1.encrypt(&ivb);
+        let plain = crypto::cbc_decrypt(&self.aes1, &iv, data);
+        if !self.diffuser {
+            return plain;
+        }
+        let sk = self.sector_key(sector_no, plain.len());
+        crypto::diffuser_decrypt(&plain, &sk)
+    }
+
+    /// Inverse of decrypt_sector. Only used to build test volumes.
+    pub fn encrypt_sector(&self, sector_no: u64, data: &[u8]) -> Vec<u8> {
+        if self.xts {
+            return crypto::xts_encrypt(
+                &self.aes1,
+                self.aes2.as_ref().expect("xts needs the tweak key"),
+                sector_no,
+                data,
+            );
+        }
+        let mut ivb = [0u8; 16];
+        ivb[..8].copy_from_slice(&sector_no.to_le_bytes());
+        let iv = self.aes1.encrypt(&ivb);
+        if !self.diffuser {
+            return crypto::cbc_encrypt(&self.aes1, &iv, data);
+        }
+        let sk = self.sector_key(sector_no, data.len());
+        let diffused = crypto::diffuser_encrypt(data, &sk);
+        crypto::cbc_encrypt(&self.aes1, &iv, &diffused)
+    }
+}
+
+// ----------------------------------------------------------- unlocked volume
+
+/// An unlocked FVE volume: decrypts on demand and presents plaintext sectors.
+pub struct Volume {
+    pub base: u64,
+    pub size: u64,
+    pub sector_size: u64,
+    pub method: u32,
+    cipher: Cipher,
+    header_bytes: u64,
+    header_src: u64,
+}
+
+impl Volume {
+    /// Plaintext bytes at a volume-relative offset.
+    pub fn read(&self, src: &Source, offset: u64, length: usize) -> Vec<u8> {
+        if offset >= self.size || length == 0 {
+            return Vec::new();
+        }
+        let length = (length as u64).min(self.size - offset);
+        let ss = self.sector_size;
+        let start = offset - offset % ss;
+        let mut end = offset + length;
+        end += (ss - end % ss) % ss;
+        let mut out = Vec::with_capacity((end - start) as usize);
+        let mut pos = start;
+        while pos < end {
+            out.extend_from_slice(&self.decrypt_one(src, pos));
+            pos += ss;
+        }
+        let lo = (offset - start) as usize;
+        out[lo..lo + length as usize].to_vec()
+    }
+
+    fn decrypt_one(&self, src: &Source, vpos: u64) -> Vec<u8> {
+        let ss = self.sector_size;
+        // The first header_sectors hold BDE boot code; the real (encrypted)
+        // originals live at volume_header_offset.
+        if vpos < self.header_bytes && self.header_src != 0 {
+            let at = self.header_src + vpos;
+            let ct = src.pread(at, ss as usize);
+            return self.cipher.decrypt_sector(at / ss, &ct);
+        }
+        let mut ct = src.pread(self.base + vpos, ss as usize);
+        ct.resize(ss as usize, 0);
+        self.cipher.decrypt_sector(vpos / ss, &ct)
+    }
+}
+
+/// Three FVE metadata block offsets, stored at 0x160 of the boot sector.
+fn metadata_offsets(boot: &[u8]) -> Vec<u64> {
+    if boot.len() < 0x178 {
+        return Vec::new();
+    }
+    (0..3).map(|i| u64le(boot, 0x160 + i * 8)).collect()
+}
+
+pub fn is_bitlocker(src: &Source, base: u64) -> bool {
+    let boot = src.pread(base, 512);
+    boot.len() >= 11 && &boot[3..11] == FVE_SIGNATURE
+}
+
+/// Detect and unlock a BitLocker volume at `base`; Ok(None) if it is not FVE.
+pub fn unlock_volume(
+    src: &Source,
+    base: u64,
+    creds: &Credentials,
+) -> Result<Option<Volume>, String> {
+    let boot = src.pread(base, 512);
+    if boot.len() < 11 || &boot[3..11] != FVE_SIGNATURE {
+        return Ok(None);
+    }
+    let sector_size = match u16le(&boot, 11) {
+        0 => 512u64,
+        n => n as u64,
+    };
+    let mut meta = None;
+    for off in metadata_offsets(&boot) {
+        if off == 0 {
+            continue;
+        }
+        let block = src.pread(base + off, 0x10000);
+        if block.len() >= 8 && &block[..8] == FVE_SIGNATURE {
+            if let Ok(m) = parse_metadata(&block) {
+                meta = Some(m);
+                break;
+            }
+        }
+    }
+    let meta = meta.ok_or("FVE boot sector found but no valid metadata block")?;
+    let fvek = recover_fvek(&meta, creds)?;
+    let cipher = Cipher::new(meta.encryption_method, &fvek)?;
+    let size = if meta.encrypted_volume_size > 0 {
+        meta.encrypted_volume_size
+    } else {
+        src.size() - base
+    };
+    Ok(Some(Volume {
+        base,
+        size,
+        sector_size,
+        method: meta.encryption_method,
+        cipher,
+        header_bytes: meta.header_sectors as u64 * sector_size,
+        header_src: meta.volume_header_offset,
+    }))
+}

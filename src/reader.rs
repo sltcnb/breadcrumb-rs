@@ -54,6 +54,67 @@ fn looks_like_ewf(path: &str, head: &[u8]) -> bool {
     head.starts_with(EWF_MAGIC) || EWF_EXTS.iter().any(|e| lower.ends_with(e))
 }
 
+/// A pass-through source that decrypts BitLocker volume regions in place.
+///
+/// Absolute offsets are preserved: a locked volume at byte `base` reads back as
+/// its plaintext NTFS, so partition parsing and --offset keep working. Bytes
+/// outside any unlocked volume pass through verbatim.
+pub struct BitLockerDecrypting {
+    inner: Box<Source>,
+    volumes: Vec<crate::bitlocker::Volume>,
+}
+
+impl BitLockerDecrypting {
+    pub fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    pub fn pread(&self, offset: u64, len: usize) -> Vec<u8> {
+        if offset >= self.size() || len == 0 {
+            return Vec::new();
+        }
+        let len = (len as u64).min(self.size() - offset) as usize;
+        let mut out = Vec::with_capacity(len);
+        let mut pos = offset;
+        let end = offset + len as u64;
+        while pos < end {
+            match self
+                .volumes
+                .iter()
+                .find(|v| v.base <= pos && pos < v.base + v.size)
+            {
+                Some(v) => {
+                    let vend = end.min(v.base + v.size);
+                    out.extend_from_slice(&v.read(
+                        &self.inner,
+                        pos - v.base,
+                        (vend - pos) as usize,
+                    ));
+                    pos = vend;
+                }
+                None => {
+                    // Read up to the next volume boundary, or the end.
+                    let next = self
+                        .volumes
+                        .iter()
+                        .map(|v| v.base)
+                        .filter(|&b| b > pos)
+                        .min()
+                        .unwrap_or(end)
+                        .min(end);
+                    let chunk = self.inner.pread(pos, (next - pos) as usize);
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    pos += chunk.len() as u64;
+                    out.extend_from_slice(&chunk);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The image behind a scan.
 pub enum Source {
     Raw(Reader),
@@ -62,6 +123,7 @@ pub enum Source {
     Qcow2(crate::images::Qcow2Reader),
     Vmdk(crate::images::VmdkReader),
     Stdin(crate::images::StdinReader),
+    BitLocker(BitLockerDecrypting),
 }
 
 impl Source {
@@ -119,6 +181,7 @@ impl Source {
             Source::Qcow2(q) => q.size,
             Source::Vmdk(v) => v.size,
             Source::Stdin(s) => s.size,
+            Source::BitLocker(b) => b.size(),
         }
     }
 
@@ -130,6 +193,7 @@ impl Source {
             Source::Qcow2(q) => q.pread(offset, len),
             Source::Vmdk(v) => v.pread(offset, len),
             Source::Stdin(s) => s.pread(offset, len),
+            Source::BitLocker(b) => b.pread(offset, len),
         }
     }
 
@@ -141,10 +205,57 @@ impl Source {
             Source::Qcow2(q) => &q.path,
             Source::Vmdk(v) => &v.path,
             Source::Stdin(s) => &s.path,
+            Source::BitLocker(b) => b.inner.path(),
         }
     }
 
     /// Short description of what was opened, for the scan banner.
+    /// Wrap this source so BitLocker volumes read back as plaintext.
+    ///
+    /// Every FVE volume found -- the whole source, or each partition of it --
+    /// is unlocked with the given credential. Returns the number unlocked.
+    pub fn unlock_bitlocker(
+        self,
+        creds: &crate::bitlocker::Credentials,
+        mut log: impl FnMut(&str),
+    ) -> Result<Self, String> {
+        use crate::bitlocker;
+        if creds.is_empty() {
+            return Ok(self);
+        }
+        let mut bases = vec![0u64];
+        for p in crate::partition::parse(&self) {
+            if p.start > 0 {
+                bases.push(p.start);
+            }
+        }
+        let mut volumes = Vec::new();
+        for base in bases {
+            if !bitlocker::is_bitlocker(&self, base) {
+                continue;
+            }
+            match bitlocker::unlock_volume(&self, base, creds)? {
+                Some(v) => {
+                    log(&format!(
+                        "bitlocker: unlocked volume @ {:#x} ({}, {:.1} GiB)",
+                        v.base,
+                        bitlocker::method_name(v.method),
+                        v.size as f64 / (1u64 << 30) as f64
+                    ));
+                    volumes.push(v);
+                }
+                None => continue,
+            }
+        }
+        if volumes.is_empty() {
+            return Ok(self);
+        }
+        Ok(Source::BitLocker(BitLockerDecrypting {
+            inner: Box::new(self),
+            volumes,
+        }))
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Source::Raw(r) if r.is_device => " (device)".into(),
@@ -154,6 +265,14 @@ impl Source {
             Source::Qcow2(_) => " (QCOW2)".into(),
             Source::Vmdk(_) => " (VMDK sparse)".into(),
             Source::Stdin(_) => " (spooled from stdin)".into(),
+            Source::BitLocker(b) => format!(
+                "{}, BitLocker unlocked",
+                b.inner
+                    .describe()
+                    .trim_start_matches(' ')
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+            ),
         }
     }
 }

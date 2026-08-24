@@ -21,6 +21,9 @@ path = "src/main.rs"
 # The whole point of the port: SIMD-accelerated multi-pattern search.
 aho-corasick = "1.1"
 sha2 = "0.10"
+# AES-128/256 block cipher only; XTS, CBC, CCM and the Elephant diffuser are
+# built on top here, so the BitLocker path stays auditable in one file.
+aes = "0.8"
 # Pure-Rust inflate (miniz_oxide), for the gzip handler. No C toolchain needed.
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
