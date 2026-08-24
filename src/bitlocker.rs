@@ -483,11 +483,52 @@ pub fn is_bitlocker(src: &Source, base: u64) -> bool {
     boot.len() >= 11 && &boot[3..11] == FVE_SIGNATURE
 }
 
+/// Walk the volume for FVE metadata blocks, sector-aligned.
+///
+/// The header's three offsets are the normal route; this is for volumes where
+/// they do not resolve -- a partly overwritten header, an unusual layout, or a
+/// reader that hands back the wrong bytes. It reads the whole volume, so it is
+/// opt-in rather than automatic.
+pub fn scan_for_metadata(
+    src: &Source,
+    base: u64,
+    limit: u64,
+    mut log: impl FnMut(&str),
+) -> Option<FveMetadata> {
+    const STEP: usize = 8 << 20;
+    let mut pos = base;
+    let end = base.saturating_add(limit).min(src.size());
+    while pos < end {
+        let want = ((end - pos) as usize).min(STEP + 512);
+        let buf = src.pread(pos, want);
+        if buf.is_empty() {
+            break;
+        }
+        let scan_to = buf.len().saturating_sub(8).min(STEP);
+        let mut i = 0usize;
+        while i <= scan_to {
+            if buf[i..i + 8] == *FVE_SIGNATURE {
+                let at = pos + i as u64;
+                let block = src.pread(at, 0x10000);
+                if let Ok(m) = parse_metadata(&block) {
+                    log(&format!("bitlocker: metadata block found at {at:#x}"));
+                    return Some(m);
+                }
+            }
+            i += 512; // metadata blocks are sector aligned
+        }
+        pos += STEP as u64;
+    }
+    None
+}
+
 /// Detect and unlock a BitLocker volume at `base`; Ok(None) if it is not FVE.
 pub fn unlock_volume(
     src: &Source,
     base: u64,
     creds: &Credentials,
+    scan_metadata: bool,
+    mut log: impl FnMut(&str),
 ) -> Result<Option<Volume>, String> {
     let boot = src.pread(base, 512);
     if boot.len() < 11 || &boot[3..11] != FVE_SIGNATURE {
@@ -498,19 +539,51 @@ pub fn unlock_volume(
         n => n as u64,
     };
     let mut meta = None;
+    let mut tried: Vec<String> = Vec::new();
     for off in metadata_offsets(&boot) {
         if off == 0 {
             continue;
         }
         let block = src.pread(base + off, 0x10000);
         if block.len() >= 8 && &block[..8] == FVE_SIGNATURE {
-            if let Ok(m) = parse_metadata(&block) {
-                meta = Some(m);
-                break;
+            match parse_metadata(&block) {
+                Ok(m) => {
+                    meta = Some(m);
+                    break;
+                }
+                Err(e) => tried.push(format!("{off:#x}: signature present but {e}")),
             }
+        } else {
+            // Report what is actually there: zeros usually mean the read did
+            // not reach the data, other bytes mean the offset is wrong.
+            let head: String = block.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            tried.push(format!(
+                "{off:#x}: found {} ({} bytes read)",
+                if head.is_empty() {
+                    "nothing".into()
+                } else {
+                    head
+                },
+                block.len()
+            ));
         }
     }
-    let meta = meta.ok_or("FVE boot sector found but no valid metadata block")?;
+    if meta.is_none() && scan_metadata {
+        log("bitlocker: header offsets did not resolve, scanning the volume...");
+        meta = scan_for_metadata(src, base, src.size().saturating_sub(base), &mut log);
+    }
+    let meta = meta.ok_or_else(|| {
+        format!(
+            "FVE boot sector at {base:#x} found but no valid metadata block. \
+             Offsets from the boot sector: [{}]{}",
+            tried.join("; "),
+            if scan_metadata {
+                " (volume scan also found none)"
+            } else {
+                ". Retry with --bitlocker-scan-metadata to search the volume."
+            }
+        )
+    })?;
     let fvek = recover_fvek(&meta, creds)?;
     let cipher = Cipher::new(meta.encryption_method, &fvek)?;
     let size = if meta.encrypted_volume_size > 0 {

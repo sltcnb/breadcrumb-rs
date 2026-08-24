@@ -217,6 +217,7 @@ impl Source {
     pub fn unlock_bitlocker(
         self,
         creds: &crate::bitlocker::Credentials,
+        scan_metadata: bool,
         mut log: impl FnMut(&str),
     ) -> Result<Self, String> {
         use crate::bitlocker;
@@ -234,7 +235,7 @@ impl Source {
             if !bitlocker::is_bitlocker(&self, base) {
                 continue;
             }
-            match bitlocker::unlock_volume(&self, base, creds)? {
+            match bitlocker::unlock_volume(&self, base, creds, scan_metadata, &mut log)? {
                 Some(v) => {
                     log(&format!(
                         "bitlocker: unlocked volume @ {:#x} ({}, {:.1} GiB)",

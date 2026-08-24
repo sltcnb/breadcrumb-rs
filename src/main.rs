@@ -47,6 +47,9 @@ options:
                           unlock BitLocker with a startup-key .BEK file
       --bitlocker-fvek HEX
                           supply the raw FVEK, skipping key recovery
+      --bitlocker-scan-metadata
+                          search the volume for FVE metadata when the offsets
+                          in the boot sector do not resolve (reads it all)
       --machine           JSON-lines events on stdout (for wrapping)
   -q, --quiet             no progress output
   -V, --version           print version and exit
@@ -94,6 +97,7 @@ fn run() -> Result<ExitCode, String> {
     let mut hash_source = false;
     let mut machine = false;
     let mut creds = breadcrumb_rs::bitlocker::Credentials::default();
+    let mut scan_metadata = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -166,6 +170,7 @@ fn run() -> Result<ExitCode, String> {
                 creds.recovery = Some(key);
             }
             "--bitlocker-password" => creds.password = Some(next(&mut i)?),
+            "--bitlocker-scan-metadata" => scan_metadata = true,
             "--bitlocker-bek" => {
                 let path = next(&mut i)?;
                 creds.bek = Some(
@@ -218,7 +223,7 @@ fn run() -> Result<ExitCode, String> {
 
     let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
     let quiet = opts.quiet;
-    let reader = reader.unlock_bitlocker(&creds, |msg| {
+    let reader = reader.unlock_bitlocker(&creds, scan_metadata, |msg| {
         if !quiet {
             eprintln!("{msg}");
         }

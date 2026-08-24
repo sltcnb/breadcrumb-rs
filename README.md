@@ -190,6 +190,11 @@ and AES-CBC + **Elephant diffuser** (Vista/7). Only the AES block cipher comes
 from a crate; XTS, CBC, CCM and the diffuser are implemented in `src/crypto.rs`
 so the whole decryption path reads as one file.
 
+If the three FVE metadata offsets in the boot sector do not resolve, the error
+names each offset and the bytes actually found there, and
+`--bitlocker-scan-metadata` walks the volume for the metadata block instead —
+for a header that is partly overwritten, or a layout this code does not expect.
+
 A credential that unlocks nothing is an error, not an empty result — carving
 ciphertext and reporting "0 files" is indistinguishable from an empty disk.
 

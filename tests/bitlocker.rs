@@ -31,7 +31,9 @@ fn out_dir(tag: &str) -> PathBuf {
 
 fn carve_unlocked(image: &Path, creds: &Credentials, tag: &str) -> Vec<(u64, u64, String)> {
     let src = Source::open(image.to_str().unwrap()).unwrap();
-    let src = src.unlock_bitlocker(creds, |_| {}).expect("unlock failed");
+    let src = src
+        .unlock_bitlocker(creds, false, |_| {})
+        .expect("unlock failed");
     assert!(
         matches!(src, Source::BitLocker(_)),
         "volume was not unlocked"
@@ -77,7 +79,7 @@ fn the_wrong_recovery_password_is_a_clean_failure() {
         ..Default::default()
     };
     let err = src
-        .unlock_bitlocker(&creds, |_| {})
+        .unlock_bitlocker(&creds, false, |_| {})
         .err()
         .expect("wrong key accepted");
     assert!(err.contains("no VMK could be unlocked"), "{err}");
@@ -167,10 +169,48 @@ fn recovery_password_parsing_matches_the_documented_rules() {
 }
 
 #[test]
+fn a_damaged_header_reports_what_it_found_and_the_scan_recovers_it() {
+    // Point the three header offsets at data that is not metadata, the way a
+    // partly overwritten header would.
+    let mut data = std::fs::read(fixture("bitlocker_xts256.dd")).unwrap();
+    for k in 0..3usize {
+        data[0x160 + k * 8..0x168 + k * 8].copy_from_slice(&0x5000u64.to_le_bytes());
+    }
+    let dir = out_dir("damaged");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("broken.dd");
+    std::fs::write(&path, &data).unwrap();
+    let creds = Credentials {
+        recovery: Some(RECOVERY.into()),
+        ..Default::default()
+    };
+
+    // Without the scan: an error that names the offsets tried and the bytes
+    // actually there, so the failure can be diagnosed from the message alone.
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+    let err = src
+        .unlock_bitlocker(&creds, false, |_| {})
+        .err()
+        .expect("accepted");
+    assert!(err.contains("0x5000"), "{err}");
+    assert!(err.contains("--bitlocker-scan-metadata"), "{err}");
+
+    // With the scan: the metadata block is found by walking the volume.
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+    let mut logged = String::new();
+    let src = src
+        .unlock_bitlocker(&creds, true, |m| logged.push_str(m))
+        .expect("scan failed to find the metadata");
+    assert!(matches!(src, Source::BitLocker(_)));
+    assert!(logged.contains("metadata block found at"), "{logged}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_credentials_leave_the_source_alone() {
     let src = Source::open(fixture("bitlocker_xts256.dd").to_str().unwrap()).unwrap();
     let src = src
-        .unlock_bitlocker(&Credentials::default(), |_| {})
+        .unlock_bitlocker(&Credentials::default(), false, |_| {})
         .unwrap();
     assert!(
         !matches!(src, Source::BitLocker(_)),
