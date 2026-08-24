@@ -3,6 +3,7 @@
 use breadcrumb_rs::carver::{run_parallel, Options, Record};
 use breadcrumb_rs::json;
 use breadcrumb_rs::reader::Source;
+use breadcrumb_rs::report;
 use breadcrumb_rs::signatures::{resolve_types, Signature, SIGNATURES};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -28,6 +29,17 @@ options:
       --no-skip           also carve files embedded inside other files
       --no-dedup          keep byte-identical duplicates
       --dry-run           inventory only, write nothing
+      --grep PATTERN      search the source for a string instead of carving
+                          (repeatable; both ASCII and UTF-16LE are matched)
+  -i, --ignore-case       case-insensitive --grep
+      --max-hits N        stop after N --grep hits
+      --list-partitions   print the partition table and detected filesystems
+      --csv FILE          write a CSV of the carve results
+      --bodyfile FILE     write a Sleuth Kit bodyfile
+      --timeline FILE     write a timeline CSV
+      --html FILE         write an HTML report
+      --hash-source       hash the whole source for the manifest (custody)
+      --machine           JSON-lines events on stdout (for wrapping)
   -q, --quiet             no progress output
   -V, --version           print version and exit
   -h, --help              this help
@@ -63,6 +75,16 @@ fn run() -> Result<ExitCode, String> {
     let mut opts = Options::default();
     let mut source: Option<String> = None;
     let mut types: Option<String> = None;
+    let mut grep_patterns: Vec<String> = Vec::new();
+    let mut ignore_case = false;
+    let mut max_hits: usize = 0;
+    let mut list_partitions = false;
+    let mut csv_path: Option<String> = None;
+    let mut bodyfile_path: Option<String> = None;
+    let mut timeline_path: Option<String> = None;
+    let mut html_path: Option<String> = None;
+    let mut hash_source = false;
+    let mut machine = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -115,6 +137,22 @@ fn run() -> Result<ExitCode, String> {
             "--no-skip" => opts.skip_carved = false,
             "--no-dedup" => opts.dedup = false,
             "--dry-run" => opts.dry_run = true,
+            "--grep" => grep_patterns.push(next(&mut i)?),
+            "-i" | "--ignore-case" => ignore_case = true,
+            "--max-hits" => {
+                let v = next(&mut i)?;
+                max_hits = v.parse().map_err(|_| format!("not a number: {v:?}"))?;
+            }
+            "--list-partitions" | "--list-parts" => list_partitions = true,
+            "--csv" => csv_path = Some(next(&mut i)?),
+            "--bodyfile" => bodyfile_path = Some(next(&mut i)?),
+            "--timeline" => timeline_path = Some(next(&mut i)?),
+            "--html" => html_path = Some(next(&mut i)?),
+            "--hash-source" => hash_source = true,
+            "--machine" => {
+                machine = true;
+                opts.quiet = true;
+            }
             "-q" | "--quiet" => opts.quiet = true,
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unknown option {other:?} (--help)"));
@@ -145,6 +183,48 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
+
+    if list_partitions {
+        let parts = breadcrumb_rs::partition::parse(&reader);
+        println!("{}", breadcrumb_rs::partition::format_table(&parts));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !grep_patterns.is_empty() {
+        let mut count = 0usize;
+        breadcrumb_rs::grep::search(
+            &reader,
+            &grep_patterns,
+            opts.start,
+            opts.length,
+            ignore_case,
+            max_hits,
+            |h| {
+                count += 1;
+                if machine {
+                    println!(
+                        "{}",
+                        json::object(vec![
+                            ("event", json::string("hit")),
+                            ("offset", json::number(h.offset)),
+                            ("pattern", json::string(&h.pattern)),
+                            ("encoding", json::string(h.encoding)),
+                            ("context", json::string(&h.context)),
+                        ])
+                    );
+                } else {
+                    println!(
+                        "{:#014x}  {:<9} {:?}: {}",
+                        h.offset, h.encoding, h.pattern, h.context
+                    );
+                }
+            },
+        );
+        if !opts.quiet && !machine {
+            eprintln!("\n{count} hit(s)");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if !opts.quiet {
         eprintln!(
             "scanning {}{} ({:.1} MiB) for {} type(s), {} thread(s)",
@@ -160,7 +240,71 @@ fn run() -> Result<ExitCode, String> {
     let records = run_parallel(&reader, &sigs, &opts);
     let elapsed = t0.elapsed().as_secs_f64();
 
-    let manifest_path = write_manifest(&source, &reader, &records, &opts, elapsed)?;
+    if machine {
+        for r in &records {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("carve")),
+                    ("type", json::string(r.kind)),
+                    ("ext", json::string(r.ext)),
+                    ("offset", json::number(r.offset)),
+                    ("size", json::number(r.size)),
+                    ("sha256", json::string(&r.sha256)),
+                    ("validated", json::boolean(r.validated)),
+                    ("path", json::string(&r.path)),
+                ])
+            );
+        }
+    }
+
+    let source_hash = if hash_source {
+        Some(hash_whole_source(&reader))
+    } else {
+        None
+    };
+    for (path, body) in [
+        (csv_path, report::csv(&records)),
+        (bodyfile_path, report::bodyfile(&records)),
+        (timeline_path, report::timeline(&records)),
+        (
+            html_path,
+            report::html(reader.path(), reader.size(), &records, elapsed),
+        ),
+    ] {
+        if let Some(path) = path {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            std::fs::write(&path, body).map_err(|e| format!("{path}: {e}"))?;
+            if !opts.quiet {
+                eprintln!("wrote {path}");
+            }
+        }
+    }
+
+    let manifest_path = write_manifest(
+        &source,
+        &reader,
+        &records,
+        &opts,
+        elapsed,
+        source_hash.as_deref(),
+    )?;
+    if machine {
+        println!(
+            "{}",
+            json::object(vec![
+                ("event", json::string("summary")),
+                ("carved", json::number(records.len() as u64)),
+                ("source_size", json::number(reader.size())),
+                ("elapsed_s", json::float(elapsed)),
+                ("manifest", json::string(&manifest_path)),
+            ])
+        );
+    }
     if !opts.quiet {
         let mibs = reader.size() as f64 / (1 << 20) as f64 / elapsed.max(1e-9);
         let dups = records.iter().filter(|r| r.duplicate_of.is_some()).count();
@@ -180,12 +324,29 @@ fn run() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// SHA-256 over every byte of the source, for chain-of-custody records.
+fn hash_whole_source(reader: &Source) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut pos = 0u64;
+    while pos < reader.size() {
+        let block = reader.pread(pos, 8 << 20);
+        if block.is_empty() {
+            break;
+        }
+        hasher.update(&block);
+        pos += block.len() as u64;
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn write_manifest(
     source: &str,
     reader: &Source,
     records: &[Record],
     opts: &Options,
     elapsed: f64,
+    source_sha256: Option<&str>,
 ) -> Result<String, String> {
     let abs = std::fs::canonicalize(source)
         .map(|p| p.to_string_lossy().to_string())
@@ -210,13 +371,17 @@ fn write_manifest(
             ("path", json::string(&r.path)),
         ]));
     }
-    let manifest = json::object(vec![
+    let mut fields = vec![
         ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
         ("source", json::string(&abs)),
         ("source_size", json::number(reader.size())),
         ("elapsed_s", json::float(elapsed)),
-        ("files", json::array(files)),
-    ]);
+    ];
+    if let Some(sha) = source_sha256 {
+        fields.push(("source_sha256", json::string(sha)));
+    }
+    fields.push(("files", json::array(files)));
+    let manifest = json::object(fields);
 
     let dir = std::path::Path::new(&opts.out_dir);
     if records.is_empty() && opts.dry_run {
