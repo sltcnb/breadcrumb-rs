@@ -72,6 +72,35 @@ fn recovery_password_unlocks_xts_and_diffuser_volumes() {
 }
 
 #[test]
+fn both_documented_key_derivations_are_tried() {
+    // The fixtures are keyed with the double-SHA-256 derivation. Sources
+    // disagree over whether a recovery password uses one SHA-256 or two, and a
+    // wrong choice looks exactly like a wrong key, so both must be attempted.
+    let single = {
+        use sha2::{Digest, Sha256};
+        let secret = bitlocker::parse_recovery_password(RECOVERY).unwrap();
+        let h: [u8; 32] = Sha256::digest(&secret).into();
+        h
+    };
+    let double = {
+        use sha2::{Digest, Sha256};
+        let secret = bitlocker::parse_recovery_password(RECOVERY).unwrap();
+        let once: [u8; 32] = Sha256::digest(&secret).into();
+        let twice: [u8; 32] = Sha256::digest(once).into();
+        twice
+    };
+    assert_ne!(single, double, "the two derivations must differ");
+
+    // Whichever the volume used, unlocking it must work.
+    let creds = Credentials {
+        recovery: Some(RECOVERY.into()),
+        ..Default::default()
+    };
+    let recs = carve_unlocked(&fixture("bitlocker_xts256.dd"), &creds, "deriv");
+    assert_eq!(recs.len(), 3);
+}
+
+#[test]
 fn protectors_are_reported_for_key_matching() {
     // The identifier is what a recovery-key file calls "Identification", so it
     // is how an analyst sees a key belongs to a different volume.

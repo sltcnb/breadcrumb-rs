@@ -131,10 +131,18 @@ pub fn parse_recovery_password(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// SHA-256 applied twice: the BitLocker user/recovery key hash.
-fn password_hash(data: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(data);
-    Sha256::digest(first).into()
+/// The candidate initial hashes for a secret, in the order to try them.
+///
+/// A user passphrase is documented as SHA-256 applied twice over its UTF-16LE
+/// form; a recovery password is documented as a single SHA-256 over the 16-byte
+/// value the digit groups decode to. Sources disagree on which applies where,
+/// and a wrong choice is indistinguishable from a wrong key -- so try both and
+/// let the CCM MAC decide. The cost is one extra key stretch, only on the path
+/// that would otherwise have failed outright.
+fn password_hashes(data: &[u8]) -> [[u8; 32]; 2] {
+    let single: [u8; 32] = Sha256::digest(data).into();
+    let double: [u8; 32] = Sha256::digest(single).into();
+    [double, single]
 }
 
 /// BitLocker key stretch: 2^20 SHA-256 rounds over an 88-byte struct of
@@ -320,10 +328,12 @@ fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
             _ => None,
         };
         if let Some(secret) = secret {
-            let dk = stretch_key(&password_hash(&secret), salt);
-            for blob in &blobs {
-                if let Some(payload) = ccm_blob_decrypt(&dk, blob) {
-                    return Some(key_from_payload(&payload));
+            for initial in password_hashes(&secret) {
+                let dk = stretch_key(&initial, salt);
+                for blob in &blobs {
+                    if let Some(payload) = ccm_blob_decrypt(&dk, blob) {
+                        return Some(key_from_payload(&payload));
+                    }
                 }
             }
             return None;
