@@ -51,6 +51,8 @@ options:
                           search the volume for FVE metadata when the offsets
                           in the boot sector do not resolve (reads it all)
       --machine           JSON-lines events on stdout (for wrapping)
+      --hexdump OFF[:LEN] print LEN bytes at OFF (decoded, after any unlock)
+                          and exit; for inspecting a structure by hand
   -q, --quiet             no progress output
   -V, --version           print version and exit
   -h, --help              this help
@@ -98,6 +100,7 @@ fn run() -> Result<ExitCode, String> {
     let mut machine = false;
     let mut creds = breadcrumb_rs::bitlocker::Credentials::default();
     let mut scan_metadata = false;
+    let mut hexdump: Option<(u64, usize)> = None;
     let mut i = 0;
 
     while i < argv.len() {
@@ -171,6 +174,19 @@ fn run() -> Result<ExitCode, String> {
             }
             "--bitlocker-password" => creds.password = Some(next(&mut i)?),
             "--bitlocker-scan-metadata" => scan_metadata = true,
+            "--hexdump" => {
+                let v = next(&mut i)?;
+                let (off, len) = match v.split_once(':') {
+                    Some((o, l)) => (o.to_string(), parse_size(l)? as usize),
+                    None => (v, 256),
+                };
+                let off = if let Some(hex) = off.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16).map_err(|_| format!("not an offset: {off:?}"))?
+                } else {
+                    parse_size(&off)?
+                };
+                hexdump = Some((off, len));
+            }
             "--bitlocker-bek" => {
                 let path = next(&mut i)?;
                 creds.bek = Some(
@@ -228,6 +244,35 @@ fn run() -> Result<ExitCode, String> {
             eprintln!("{msg}");
         }
     })?;
+
+    if let Some((off, len)) = hexdump {
+        let data = reader.pread(off, len);
+        println!(
+            "{} bytes at {off:#x} (source is {} bytes)",
+            data.len(),
+            reader.size()
+        );
+        for (row, chunk) in data.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let text: String = chunk
+                .iter()
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            println!(
+                "{:08x}  {:47}  {}",
+                off as usize + row * 16,
+                hex.join(" "),
+                text
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if list_partitions {
         let parts = breadcrumb_rs::partition::parse(&reader);
