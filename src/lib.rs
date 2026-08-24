@@ -8,6 +8,7 @@
 pub mod carver;
 pub mod ewf;
 pub mod handlers;
+pub mod images;
 pub mod json;
 pub mod reader;
 pub mod signatures;

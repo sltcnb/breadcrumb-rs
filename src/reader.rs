@@ -18,8 +18,6 @@ use std::os::unix::fs::FileExt;
 const CONTAINERS: &[(&[u8], &str)] = &[
     (b"EVF2\x0d\x0a\x81\x00", "EWF2/Ex01"),
     (b"LVF\x09\x0d\x0a\xff\x00", "EWF logical (L01)"),
-    (b"QFI\xfb", "QCOW2"),
-    (b"KDMV", "VMDK"),
     (b"conectix", "VHD"),
     (b"vhdxfile", "VHDX"),
 ];
@@ -29,8 +27,6 @@ const CONTAINERS: &[(&[u8], &str)] = &[
 const CONTAINER_EXTS: &[(&str, &str)] = &[
     (".ex01", "EWF2/Ex01"),
     (".l01", "EWF logical (L01)"),
-    (".qcow2", "QCOW2"),
-    (".vmdk", "VMDK"),
     (".vhd", "VHD"),
     (".vhdx", "VHDX"),
     (".aff", "AFF"),
@@ -58,19 +54,45 @@ fn looks_like_ewf(path: &str, head: &[u8]) -> bool {
     head.starts_with(EWF_MAGIC) || EWF_EXTS.iter().any(|e| lower.ends_with(e))
 }
 
-/// The image behind a scan: a raw file or device, or an EWF segment set.
+/// The image behind a scan.
 pub enum Source {
     Raw(Reader),
     Ewf(crate::ewf::EwfReader),
+    Split(crate::images::SplitRawReader),
+    Qcow2(crate::images::Qcow2Reader),
+    Vmdk(crate::images::VmdkReader),
+    Stdin(crate::images::StdinReader),
 }
 
 impl Source {
     pub fn open(path: &str) -> io::Result<Self> {
+        if path == "-" || path == "/dev/stdin" {
+            return Ok(Source::Stdin(crate::images::StdinReader::spool(
+                io::stdin(),
+            )?));
+        }
+        // A numbered segment with a sibling behind it is a split raw image.
+        if let Some((stem, digits)) = crate::images::split_segment_name(path) {
+            let width = digits.len();
+            let n: u64 = digits.parse().unwrap_or(0);
+            let next = format!("{stem}.{:0width$}", n + 1, width = width);
+            if Path::new(&next).exists() || n <= 1 {
+                if let Ok(r) = crate::images::SplitRawReader::open(path) {
+                    return Ok(Source::Split(r));
+                }
+            }
+        }
         let mut file = File::open(Path::new(path))?;
         let mut head = [0u8; 16];
         let n = file.read(&mut head).unwrap_or(0);
         drop(file);
         let head = &head[..n];
+        if head.starts_with(b"QFI\xfb") {
+            return Ok(Source::Qcow2(crate::images::Qcow2Reader::open(path)?));
+        }
+        if head.starts_with(b"KDMV") {
+            return Ok(Source::Vmdk(crate::images::VmdkReader::open(path)?));
+        }
         if let Some(kind) = container_kind(path, head) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -93,6 +115,10 @@ impl Source {
         match self {
             Source::Raw(r) => r.size,
             Source::Ewf(e) => e.size,
+            Source::Split(s) => s.size,
+            Source::Qcow2(q) => q.size,
+            Source::Vmdk(v) => v.size,
+            Source::Stdin(s) => s.size,
         }
     }
 
@@ -100,6 +126,10 @@ impl Source {
         match self {
             Source::Raw(r) => r.pread(offset, len),
             Source::Ewf(e) => e.pread(offset, len),
+            Source::Split(s) => s.pread(offset, len),
+            Source::Qcow2(q) => q.pread(offset, len),
+            Source::Vmdk(v) => v.pread(offset, len),
+            Source::Stdin(s) => s.pread(offset, len),
         }
     }
 
@@ -107,6 +137,10 @@ impl Source {
         match self {
             Source::Raw(r) => &r.path,
             Source::Ewf(e) => &e.path,
+            Source::Split(s) => &s.path,
+            Source::Qcow2(q) => &q.path,
+            Source::Vmdk(v) => &v.path,
+            Source::Stdin(s) => &s.path,
         }
     }
 
@@ -116,6 +150,10 @@ impl Source {
             Source::Raw(r) if r.is_device => " (device)".into(),
             Source::Raw(_) => String::new(),
             Source::Ewf(e) => format!(" (EWF, {} segment(s))", e.segment_count()),
+            Source::Split(s) => format!(" (split raw, {} segment(s))", s.count),
+            Source::Qcow2(_) => " (QCOW2)".into(),
+            Source::Vmdk(_) => " (VMDK sparse)".into(),
+            Source::Stdin(_) => " (spooled from stdin)".into(),
         }
     }
 }

@@ -325,13 +325,12 @@ fn truncated_input_never_overruns() {
 #[test]
 fn unsupported_containers_are_refused_not_carved_as_raw() {
     // Carving a container as raw reports fragments of its own compressed chunk
-    // data as recovered files, with nothing to signal the mistake. EWF is read
-    // properly (see tests/ewf.rs); everything else here must be refused.
+    // data as recovered files, with nothing to signal the mistake. EWF, QCOW2,
+    // VMDK and split raw are read properly; what is left must be refused.
     let dir = Tmp::new("container");
     let cases: &[(&str, &[u8])] = &[
         ("img.Ex01", b"EVF2\x0d\x0a\x81\x00\x01\x00\x00\x00"),
-        ("img.qcow2", b"QFI\xfb\x00\x00\x00\x03\x00"),
-        ("img.vmdk", b"KDMV\x01\x00\x00\x00\x00"),
+        ("img.vhd", b"conectix\x00\x00\x00\x00"),
         ("img.vhdx", b"vhdxfile\x00\x00\x00\x00"),
     ];
     for (name, magic) in cases {

@@ -115,15 +115,15 @@ implementation — it remains the reference and the more complete tool:
 - **Filesystem undelete modes** — NTFS / ext4 / FAT / HFS+ / APFS metadata
   recovery (`--ntfs`, `--auto`, …), which recover names and timestamps
 - **BitLocker** transparent decryption
-- **QCOW2, VMDK, VHD/VHDX, Ex01/EWF2, L01, split raw, stdin spooling.** Raw
-  images, block devices and EWF (`.E01`/`.s01`) sets are read here; the rest are
-  refused outright, by magic and by extension, because carving a container as
-  raw reports fragments of its own compressed chunk data as recovered files with
-  nothing to signal the mistake
+- **VHD/VHDX, Ex01/EWF2, L01, AFF.** Raw images, block devices, EWF
+  (`.E01`/`.s01`) sets, QCOW2, sparse VMDK, split raw and stdin are all read
+  here; what is left is refused outright, by magic and by extension, because
+  carving a container as raw reports fragments of its own compressed chunk data
+  as recovered files with nothing to signal the mistake
 
   ```
-  $ bcrumb-rs disk.vmdk -o out
-  bcrumb-rs: disk.vmdk: this is a VMDK image, which this port cannot read --
+  $ bcrumb-rs disk.vhdx -o out
+  bcrumb-rs: disk.vhdx: this is a VHDX image, which this port cannot read --
   carving it as raw would report the container's own bytes as recovered files.
   Use the Python implementation (https://github.com/sltcnb/BreadCrumb), which
   reads it directly, or convert to raw first.
@@ -132,6 +132,19 @@ implementation — it remains the reference and the more complete tool:
 - **`--grep`, `--list-partitions`, custom `--sig-file` signatures**
 - **HTML/CSV/bodyfile/timeline reports** — the JSON manifest is written, the
   derived reports are not
+
+## Image formats
+
+Detected by magic, falling back to the extension, so the image goes straight in
+with no conversion step:
+
+| Format | Notes |
+| --- | --- |
+| raw / dd | also block devices; `-` spools stdin to a temp file |
+| split raw | `.001/.002…` globbed from the first segment |
+| EWF / E01 | see below |
+| QCOW2 v2/v3 | raw + zlib clusters |
+| VMDK | monolithic sparse (grain tables) |
 
 ## EWF / E01
 

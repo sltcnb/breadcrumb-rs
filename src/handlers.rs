@@ -1398,7 +1398,8 @@ fn ebml_vint(w: &mut Window, pos: u64) -> (Option<u64>, u64) {
     if (raw.len() as u64) < len {
         return (None, len);
     }
-    let mut val = (first & (0xFF >> len)) as u64;
+    // Widen before shifting: an 8-byte vint shifts the mask out of a u8.
+    let mut val = (first as u32 & (0xFFu32 >> len)) as u64;
     for &byte in &raw[1..] {
         val = (val << 8) | byte as u64;
     }
