@@ -240,3 +240,104 @@ fn deletion_artefact_parsing_survives_mutated_records() {
         );
     }
 }
+
+#[test]
+fn filesystem_parsers_survive_mutated_volumes() {
+    // The undelete modes read geometry, runlists, extents and directory entries
+    // straight off the disk. A mutated volume must be refused or partly read,
+    // never panic and never hang -- and never write anything, since these run
+    // with dry_run set.
+    let mut rng = Rng::new(0xF11E5);
+    let dir = Tmp::new("fsparsers");
+    let fixtures = [
+        "tests/fixtures/ntfs_deleted.img",
+        "tests/fixtures/ntfs_artifacts.img",
+    ];
+    let mut bases: Vec<Vec<u8>> = Vec::new();
+    for rel in fixtures {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        if let Ok(data) = std::fs::read(&p) {
+            bases.push(data);
+        }
+    }
+    assert!(!bases.is_empty(), "no volume fixtures to mutate");
+
+    let out = dir.0.join("out").to_string_lossy().to_string();
+    for round in 0..40 {
+        let base = &bases[round % bases.len()];
+        let mutated = mutate(&mut rng, base);
+        let img = dir.0.join("volume.img");
+        if std::fs::write(&img, &mutated).is_err() {
+            continue;
+        }
+        let Ok(src) = Source::open(img.to_str().unwrap()) else {
+            continue;
+        };
+        let started = Instant::now();
+        let _ = breadcrumb_rs::ntfs::recover(
+            &src,
+            0,
+            &breadcrumb_rs::ntfs::Options {
+                out_dir: out.clone(),
+                dry_run: true,
+                include_live: true,
+                min_size: 0,
+            },
+            |_| {},
+        );
+        let _ = breadcrumb_rs::fat::recover(
+            &src,
+            0,
+            &breadcrumb_rs::fat::Options {
+                out_dir: out.clone(),
+                dry_run: true,
+                include_live: true,
+                min_size: 0,
+            },
+            |_| {},
+        );
+        let _ = breadcrumb_rs::ext4::recover(
+            &src,
+            0,
+            &breadcrumb_rs::ext4::Options {
+                out_dir: out.clone(),
+                dry_run: true,
+                include_live: true,
+                min_size: 0,
+            },
+            |_| {},
+        );
+        let _ = breadcrumb_rs::hfs::recover(
+            &src,
+            0,
+            &breadcrumb_rs::hfs::Options {
+                out_dir: out.clone(),
+                dry_run: true,
+                include_live: true,
+                min_size: 0,
+                scan_volume: true,
+            },
+            |_| {},
+        );
+        let _ = breadcrumb_rs::apfs::recover(
+            &src,
+            0,
+            &breadcrumb_rs::apfs::Options {
+                out_dir: out.clone(),
+                dry_run: true,
+                min_size: 0,
+            },
+            |_| {},
+        );
+        let _ = breadcrumb_rs::partition::parse(&src);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a filesystem parser hung on round {round}"
+        );
+        // dry_run must mean exactly that.
+        assert!(
+            !std::path::Path::new(&out).exists(),
+            "a dry run wrote to {out}"
+        );
+    }
+}

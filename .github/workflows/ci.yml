@@ -45,13 +45,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      # A prebuilt binary rather than `cargo install cargo-fuzz`, which spent
+      # fifteen minutes compiling and made this the job that always got
+      # cancelled by the next push.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Cache the fuzz build
+        uses: actions/cache@v4
+        with:
+          path: fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
+          restore-keys: fuzz-${{ runner.os }}-
       - name: Build the fuzz targets
         run: cargo fuzz build
       - name: Short campaign on each target
         run: |
-          for t in handlers ewf fve artifacts; do
+          for t in handlers ewf fve artifacts filesystems; do
             cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
           done
 

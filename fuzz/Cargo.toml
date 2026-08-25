@@ -37,3 +37,9 @@ name = "artifacts"
 path = "fuzz_targets/artifacts.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "filesystems"
+path = "fuzz_targets/filesystems.rs"
+test = false
+doc = false
