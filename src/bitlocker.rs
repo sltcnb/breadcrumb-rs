@@ -558,12 +558,39 @@ impl Volume {
     }
 }
 
-/// Three FVE metadata block offsets, stored at 0x160 of the boot sector.
+/// The FVE metadata block offsets in the volume header.
+///
+/// Windows 7 and later put three of them at 0xB0, right after the BitLocker
+/// identifier GUID at 0xA0; Vista used 0x160. Both are returned -- a zero entry
+/// is not a candidate, so whichever layout this volume uses, only its offsets
+/// survive.
 fn metadata_offsets(boot: &[u8]) -> Vec<u64> {
-    if boot.len() < 0x178 {
-        return Vec::new();
+    let mut out = Vec::new();
+    for base in [0xB0usize, 0x160] {
+        if boot.len() < base + 24 {
+            continue;
+        }
+        for i in 0..3 {
+            let off = u64le(boot, base + i * 8);
+            if off != 0 && !out.contains(&off) {
+                out.push(off);
+            }
+        }
     }
-    (0..3).map(|i| u64le(boot, 0x160 + i * 8)).collect()
+    out
+}
+
+/// The BitLocker identifier GUID at 0xA0, when the volume header carries one.
+pub fn volume_identifier(boot: &[u8]) -> Option<String> {
+    if boot.len() < 0xB0 {
+        return None;
+    }
+    let id = guid(&boot[0xA0..0xB0]);
+    if id.starts_with("00000000") {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 pub fn is_bitlocker(src: &Source, base: u64) -> bool {
@@ -626,6 +653,9 @@ pub fn unlock_volume(
         0 => 512u64,
         n => n as u64,
     };
+    if let Some(id) = volume_identifier(&boot) {
+        log(&format!("bitlocker: volume identifier {id}"));
+    }
     let mut meta = None;
     let mut tried: Vec<String> = Vec::new();
     for off in metadata_offsets(&boot) {
@@ -636,6 +666,9 @@ pub fn unlock_volume(
         if block.len() >= 8 && &block[..8] == FVE_SIGNATURE {
             match parse_metadata(&block) {
                 Ok(m) => {
+                    log(&format!(
+                        "bitlocker: metadata from the volume header at {off:#x}"
+                    ));
                     meta = Some(m);
                     break;
                 }
