@@ -145,8 +145,8 @@ by scenario
     bcrumb-rs disk.E01 --dump-fve --bitlocker-recovery-key ...
     bcrumb-rs disk.E01 --bitlocker-scan-metadata --bitlocker-recovery-key ...
 
-Carving gives bytes; --ntfs gives names, paths and timestamps. Deletion times
-(recycle bin, change journal) are not ported yet.
+Carving gives bytes. The undelete modes give names, paths and timestamps, and
+--deleted-times gives the deletion times themselves.
 ";
 
 /// Split the outstanding work into ranges, aligned to the scan chunk size so a

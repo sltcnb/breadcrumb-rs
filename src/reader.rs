@@ -1,8 +1,8 @@
 //! Read-only random access over an image file or block device.
 //!
-//! The source is opened read-only and never written to, the same guarantee the
-//! Python implementation makes: `File::open` requests read access only, and no
-//! code path here holds a writable handle to the source.
+//! The source is opened read-only and never written to: `File::open` requests
+//! read access only, and no code path here holds a writable handle to the
+//! source. Evidence is not modified by looking at it.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -11,10 +11,10 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-/// Container formats this port still cannot read. Carving their bytes as if
-/// they were raw yields a manifest full of nonsense -- fragments of compressed
-/// chunk data -- with no sign that anything went wrong, so refuse instead.
-/// The Python implementation reads all of these.
+/// Container formats this tool cannot read. Carving their bytes as if they were
+/// raw yields a manifest full of nonsense -- fragments of compressed chunk data
+/// -- with no sign that anything went wrong, so refuse instead and say what the
+/// file is.
 const CONTAINERS: &[(&[u8], &str)] = &[
     (b"EVF2\x0d\x0a\x81\x00", "EWF2/Ex01"),
     (b"LVF\x09\x0d\x0a\xff\x00", "EWF logical (L01)"),
@@ -159,11 +159,10 @@ impl Source {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "this is a {kind} image, which this port cannot read -- \
+                    "this is a {kind} image, which this tool cannot read -- \
                      carving it as raw would report the container's own bytes \
-                     as recovered files. Use the Python implementation \
-                     (https://github.com/sltcnb/BreadCrumb), which reads it \
-                     directly, or convert to raw first."
+                     as recovered files. Convert it to raw first, for example \
+                     with: qemu-img convert -O raw <in> <out.dd>"
                 ),
             ));
         }
@@ -315,11 +314,10 @@ impl Reader {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "this is a {kind} image, which this port cannot read -- \
+                    "this is a {kind} image, which this tool cannot read -- \
                      carving it as raw would report the container's own bytes \
-                     as recovered files. Use the Python implementation \
-                     (https://github.com/sltcnb/BreadCrumb), which reads it \
-                     directly, or convert to raw first."
+                     as recovered files. Convert it to raw first, for example \
+                     with: qemu-img convert -O raw <in> <out.dd>"
                 ),
             ));
         }

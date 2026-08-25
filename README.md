@@ -3,9 +3,13 @@
 Signature-based file carver for disk images and block devices — recovers deleted
 files by scanning raw bytes, with no filesystem metadata involved.
 
-A Rust port of the carving core of [BreadCrumb](https://github.com/sltcnb/BreadCrumb)
-(Python). Same signatures, same structure-walking handlers, same output layout —
-**byte-identical carves**, roughly **7x the throughput**.
+Carving plus filesystem undelete for NTFS, FAT/exFAT, ext2/3/4, HFS+ and APFS;
+EWF/E01 and BitLocker read natively; deep validation of what it recovers.
+
+It began as a Rust port of the carving core of
+[BreadCrumb](https://github.com/sltcnb/BreadCrumb) (Python) and is now the
+implementation that is developed — byte-identical carves at roughly **7x the
+throughput**, and since then everything above.
 
 ```sh
 cargo build --release
@@ -13,13 +17,13 @@ cargo build --release
 ./target/release/bcrumb-rs disk.E01 -o carved -j 0   # EWF sets read natively
 ```
 
-## Why a port
+## Why Rust
 
-BreadCrumb's scan is bounded almost entirely by one thing: finding candidate
-headers. Profiling the Python implementation over a 513 MiB image put **84% of
-wall-clock inside CPython's `re` engine** — the rest (reads, handlers, hashing)
-barely registered. That is the part a native multi-pattern matcher with a SIMD
-prefilter changes, and `aho-corasick` is exactly that.
+A carve is bounded almost entirely by one thing: finding candidate headers.
+Profiling the Python implementation over a 513 MiB image put **84% of wall-clock
+inside CPython's `re` engine** — the rest (reads, handlers, hashing) barely
+registered. That is the part a native multi-pattern matcher with a SIMD prefilter
+changes, and `aho-corasick` is exactly that.
 
 ## Benchmarks
 
@@ -43,9 +47,10 @@ Parallelism differs in kind, not just degree: Python forks worker *processes*
 (`-j` in BreadCrumb), while this uses threads over one read-only file handle,
 so there is no per-worker interpreter or re-open cost.
 
-## Parity with the reference implementation
+## Parity with the Python implementation
 
-Both tools were run over the same images and their manifests compared on
+The carving core was accepted by byte parity: both tools were run over the same
+images and their manifests compared on
 `(offset, size, sha256, ext, validated, duplicate_of)` for every record:
 
 | Image | Records | Identical |
@@ -56,8 +61,13 @@ Both tools were run over the same images and their manifests compared on
 | 120 MiB as a 124-segment E01 set (`E01`…`EAY`) | 7268 | yes |
 | 4 MiB as a 4-segment compressed E01 | 356 | yes |
 
-That is the acceptance test for this port: if a handler here disagreed with the
-Python one by a single byte, the hashes would diverge.
+That was the acceptance test for the port: if a handler here disagreed with the
+Python one by a single byte, the hashes would diverge. Everything added since --
+the undelete modes, validation, the artefact parsers -- is tested against
+volumes and files made by other implementations instead (`newfs_msdos`,
+`newfs_exfat`, `mke2fs`, `newfs_hfs`, `diskutil ... APFS`, `ewfacquire`,
+Python's `zipfile`/`gzip`/`sqlite3`), which is the same idea applied where there
+is no second implementation of the same tool to diff against.
 
 `cargo test` additionally carves a synthetic image containing one file of every
 supported type and checks each recovery byte-for-byte, plus the behaviour
@@ -67,7 +77,7 @@ trailing-EOL over-carve, and the profile-locked MP3 frame walk.
 
 ## What is carved
 
-All 28 types the Python implementation carves, each with a structure-walking
+28 types, each with a structure-walking
 handler that finds the file's true end:
 
 `jpg` `png` `gif` `bmp` `tif` `pdf` `rtf` `ole` (`doc`/`xls`/`ppt`/`msg`/`vsd`/`pub`/`msi`)
@@ -334,10 +344,9 @@ be reported in a different shape long after the evidence is detached.
 bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 ```
 
-## Not ported
+## Not implemented
 
-This is the carving core only. For any of the following, use the Python
-implementation — it remains the reference and the more complete tool:
+Named so an examination is not planned around something that is not here:
 
 - **`--auto` whole-disk sweep** — the mode that detects every partition's
   filesystem and runs the right undelete over each in one pass. The individual
@@ -353,10 +362,9 @@ implementation — it remains the reference and the more complete tool:
 
   ```
   $ bcrumb-rs disk.vhdx -o out
-  bcrumb-rs: disk.vhdx: this is a VHDX image, which this port cannot read --
+  bcrumb-rs: disk.vhdx: this is a VHDX image, which this tool cannot read --
   carving it as raw would report the container's own bytes as recovered files.
-  Use the Python implementation (https://github.com/sltcnb/BreadCrumb), which
-  reads it directly, or convert to raw first.
+  Convert it to raw first, for example with: qemu-img convert -O raw <in> <out.dd>
   ```
 - **Bifragment reassembly** — the gap-carving search for a file split into
   two pieces with unrelated data between them
