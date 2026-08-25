@@ -222,6 +222,29 @@ One caveat worth knowing: if the source was not a whole number of sectors, some
 acquisition tools hash bytes they then do not store, which shows up here as a
 mismatch. Real disks are always sector multiples.
 
+## Resuming an interrupted scan
+
+A scan of a few hundred gigabytes runs long enough that a power cut, a full
+disk or a stray `pkill` should not mean starting over. Finished byte ranges are
+checkpointed to `<out>/.bcrumb-state` as they complete, and `--resume` picks up
+the rest:
+
+```
+$ bcrumb-rs disk.E01 -o out -t office          # dies at 45 of 60 GiB
+scan incomplete: 45.0 GiB of 60.0 GiB done. Re-run with --resume to continue
+
+$ bcrumb-rs disk.E01 -o out -t office --resume
+resuming: 45.0 GiB of 60.0 GiB already scanned, 1 range(s) left
+resumed: carried 135 record(s) forward from the earlier manifest
+```
+
+Records from the earlier attempt are folded into the new manifest, so the result
+describes the whole image and not just the part this run did — a resumed scan
+produces the same records as a single pass, which the tests check directly. The
+state file names the source, its size and the type set, and a resume against a
+different scan is refused rather than skipping ranges of the wrong disk. It is
+deleted once the scan completes, so a later run does not skip work.
+
 ## Not filling the disk
 
 A carve can write more than the volume it is written to can hold: on a 238 GB

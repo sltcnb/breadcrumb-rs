@@ -421,6 +421,61 @@ pub fn dedupe(records: &mut [Record], dry_run: bool) {
 /// Carve windows may run past a range's end (`window_end`), so a file whose
 /// header sits near a boundary is still carved whole by the worker that owns
 /// the header -- the same contract as the Python `run_parallel`.
+/// Scan the ranges given, checkpointing each as it completes.
+///
+/// Used by --resume: the caller works out which parts are still outstanding and
+/// hands them over, so a run that died leaves the rest of the work intact.
+pub fn run_ranges(
+    reader: &Source,
+    sigs: &[&'static Signature],
+    opts: &Options,
+    ranges: &[(u64, u64)],
+    scan_end: u64,
+    mut on_range_done: impl FnMut(u64, u64),
+) -> Vec<Record> {
+    let budget = OutputBudget::new(opts.max_output);
+    let mut out: Vec<Record> = Vec::new();
+    let jobs = opts.jobs.max(1);
+    for chunk in ranges.chunks(jobs.max(1)) {
+        if budget.exhausted() {
+            break;
+        }
+        let mut produced: Vec<(u64, u64, Vec<Record>)> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for &(start, end) in chunk {
+                let mut sub = opts.clone();
+                sub.start = start;
+                sub.length = end - start;
+                sub.window_end = scan_end; // carve past a range end when needed
+                sub.quiet = true;
+                sub.dedup = false; // one dedup pass over the merged result
+                sub.jobs = 1;
+                let sigs = sigs.to_vec();
+                let budget = &budget;
+                handles.push(scope.spawn(move || {
+                    let mut c = Carver::new(reader, sigs, &sub).with_budget(budget);
+                    (start, end, c.run())
+                }));
+            }
+            for h in handles {
+                produced.push(h.join().expect("scan worker panicked"));
+            }
+        });
+        for (start, end, recs) in produced {
+            out.extend(recs);
+            if !budget.exhausted() {
+                on_range_done(start, end);
+            }
+        }
+    }
+    let mut out = containment_filter(out);
+    if opts.dedup {
+        dedupe(&mut out, opts.dry_run);
+    }
+    out
+}
+
 pub fn run_parallel(reader: &Source, sigs: &[&'static Signature], opts: &Options) -> Vec<Record> {
     let scan_end = if opts.length > 0 {
         (opts.start + opts.length).min(reader.size())

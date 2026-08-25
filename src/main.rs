@@ -1,6 +1,7 @@
 //! bcrumb-rs: signature-based file carver for disk images and block devices.
 
-use breadcrumb_rs::carver::{run_parallel, Options, Record};
+use breadcrumb_rs::carver::{run_parallel, run_ranges, Options, Record};
+use breadcrumb_rs::checkpoint;
 use breadcrumb_rs::json;
 use breadcrumb_rs::reader::Source;
 use breadcrumb_rs::report;
@@ -45,6 +46,8 @@ options:
       --hash-source       hash the whole source for the manifest (custody)
       --verify            recompute the image hashes and compare them with the
                           ones the acquisition recorded, then exit
+      --resume            continue a scan that stopped, skipping the ranges
+                          already finished (state lives in <out>/.bcrumb-state)
       --bitlocker-recovery-key KEY
                           unlock BitLocker volume(s) with a 48-digit key
       --bitlocker-password PASS
@@ -93,6 +96,76 @@ by scenario
 Filenames, timestamps and deletion dates need the filesystem, not carving:
 use the Python implementation (--ntfs, --deleted-times).
 ";
+
+/// Split the outstanding work into ranges, aligned to the scan chunk size so a
+/// resumed run reads the same boundaries as the original.
+fn plan_ranges(
+    state: &checkpoint::Checkpoint,
+    start: u64,
+    end: u64,
+    chunk: u64,
+    jobs: usize,
+) -> Vec<(u64, u64)> {
+    // Aim for a few ranges per worker: small enough that a kill loses little,
+    // large enough that the per-range overhead stays invisible.
+    let total = end.saturating_sub(start);
+    let target = (total / (jobs.max(1) as u64 * 4)).max(chunk);
+    let mut out = Vec::new();
+    for (a, b) in state.remaining(start, end) {
+        let mut pos = a;
+        while pos < b {
+            let stop = (pos + target).min(b);
+            out.push((pos, stop));
+            pos = stop;
+        }
+    }
+    out
+}
+
+/// Fold records from a previous attempt's manifest into this run's, so a
+/// resumed scan reports the whole image rather than only the part it did.
+fn merge_with_existing(out_dir: &str, mut records: Vec<Record>) -> Vec<Record> {
+    let path = std::path::Path::new(out_dir).join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return records;
+    };
+    // The manifest is ours and its shape is fixed, so the fields are pulled out
+    // directly rather than pulling in a JSON parser for one use.
+    let mut recovered = 0usize;
+    for line in text.lines() {
+        let get = |key: &str| -> Option<&str> {
+            let at = line.find(&format!("\"{key}\": "))? + key.len() + 4;
+            let rest = &line[at..];
+            let end = rest.find(',').unwrap_or(rest.len());
+            Some(rest[..end].trim().trim_matches('"'))
+        };
+        let (Some(off), Some(size), Some(sha)) = (get("offset"), get("size"), get("sha256")) else {
+            continue;
+        };
+        let (Ok(offset), Ok(size)) = (off.parse::<u64>(), size.parse::<u64>()) else {
+            continue;
+        };
+        if records.iter().any(|r| r.offset == offset && r.size == size) {
+            continue;
+        }
+        records.push(Record {
+            kind: "carved",
+            ext: get("ext").unwrap_or("bin").to_string().leak(),
+            offset,
+            size,
+            sha256: sha.to_string(),
+            validated: get("validated") == Some("true"),
+            path: get("path").unwrap_or("").to_string(),
+            duplicate_of: None,
+        });
+        recovered += 1;
+    }
+    if recovered > 0 {
+        eprintln!("resumed: carried {recovered} record(s) forward from the earlier manifest");
+    }
+    records.sort_by_key(|r| (r.offset, r.size));
+    records
+}
 
 /// Bytes free on the filesystem holding `path` (or its nearest existing parent).
 fn free_space(path: &str) -> Option<u64> {
@@ -176,6 +249,7 @@ fn run() -> Result<ExitCode, String> {
     let mut hexdump: Option<(u64, usize)> = None;
     let mut dump_fve = false;
     let mut verify = false;
+    let mut resume = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -243,6 +317,7 @@ fn run() -> Result<ExitCode, String> {
             "--html" => html_path = Some(next(&mut i)?),
             "--hash-source" => hash_source = true,
             "--verify" => verify = true,
+            "--resume" => resume = true,
             "--bitlocker-recovery-key" => {
                 let key = next(&mut i)?;
                 // Fail on a malformed key here rather than after a long scan.
@@ -492,7 +567,51 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let t0 = Instant::now();
-    let records = run_parallel(&reader, &sigs, &opts);
+    // A scan of a large image is long enough that dying part-way through should
+    // not mean starting over: completed ranges are checkpointed, and --resume
+    // picks up the rest.
+    let scan_end = if opts.length > 0 {
+        (opts.start + opts.length).min(reader.size())
+    } else {
+        reader.size()
+    };
+    let records = if opts.dry_run {
+        run_parallel(&reader, &sigs, &opts)
+    } else {
+        let fingerprint = checkpoint::Fingerprint {
+            source: reader.path().to_string(),
+            size: reader.size(),
+            types: sigs.iter().map(|s| s.name).collect::<Vec<_>>().join(","),
+        };
+        let mut state = checkpoint::Checkpoint::open(&opts.out_dir, fingerprint, resume)?;
+        let ranges = plan_ranges(&state, opts.start, scan_end, opts.chunk_size, opts.jobs);
+        if resume && state.bytes_done() > 0 && !opts.quiet {
+            eprintln!(
+                "resuming: {} of {} already scanned, {} range(s) left",
+                human(state.bytes_done()),
+                human(scan_end - opts.start),
+                ranges.len()
+            );
+        }
+        let recs = run_ranges(&reader, &sigs, &opts, &ranges, scan_end, |a, b| {
+            state.complete(a, b)
+        });
+        let complete = state.remaining(opts.start, scan_end).is_empty();
+        let mut merged = recs;
+        if resume {
+            merged = merge_with_existing(&opts.out_dir, merged);
+        }
+        if complete {
+            state.finish();
+        } else if !opts.quiet {
+            eprintln!(
+                "scan incomplete: {} of {} done. Re-run with --resume to continue",
+                human(state.bytes_done()),
+                human(scan_end - opts.start)
+            );
+        }
+        merged
+    };
     let elapsed = t0.elapsed().as_secs_f64();
 
     if machine {

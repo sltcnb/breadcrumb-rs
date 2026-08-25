@@ -7,6 +7,7 @@
 
 pub mod bitlocker;
 pub mod carver;
+pub mod checkpoint;
 pub mod crypto;
 pub mod ewf;
 pub mod grep;
