@@ -55,6 +55,8 @@ options:
                           records left outside the live tree
       --apfs              APFS recovery: scan for superseded copy-on-write
                           objects, which is where deleted files survive
+      --auto              find every partition and run the undelete mode its
+                          filesystem calls for, one volume at a time
       --include-live      with an undelete mode, also recover files in use
       --deleted-times     when files were deleted, from $Recycle.Bin/$I records
                           and the $UsnJrnl change journal (writes deletions.csv)
@@ -119,6 +121,8 @@ by scenario
     bcrumb-rs disk.E01 --deleted-times -o out
   ...from artefacts already pulled off a machine
     bcrumb-rs ./artefacts --deleted-times --events deletions.csv
+  a whole disk, each partition with the right undelete mode
+    bcrumb-rs disk.E01 --auto -o out --csv files.csv
   what is on the disk before committing to a long scan
     bcrumb-rs disk.E01 --list-partitions
   inventory first: how much would a full carve write?
@@ -327,6 +331,7 @@ fn run() -> Result<ExitCode, String> {
     let mut ext_mode = false;
     let mut hfs_mode = false;
     let mut apfs_mode = false;
+    let mut auto_mode = false;
     let mut include_live = false;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
@@ -409,6 +414,7 @@ fn run() -> Result<ExitCode, String> {
             "--ext4" | "--ext" => ext_mode = true,
             "--hfs" | "--hfsplus" => hfs_mode = true,
             "--apfs" => apfs_mode = true,
+            "--auto" => auto_mode = true,
             "--include-live" => include_live = true,
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
@@ -639,6 +645,10 @@ fn run() -> Result<ExitCode, String> {
 
     if apfs_mode {
         return run_apfs(&reader, &opts, machine, csv_path.as_deref());
+    }
+
+    if auto_mode {
+        return run_auto(&reader, &opts, include_live, machine, csv_path.as_deref());
     }
 
     if list_partitions {
@@ -1455,6 +1465,412 @@ fn run_apfs(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One recovered file, from whichever filesystem produced it.
+///
+/// The per-filesystem records carry different identities (an MFT number, an
+/// inode, a CNID, a directory-entry offset) and different timestamps; this is
+/// what they have in common, for one report across a whole disk.
+struct AutoRecord {
+    volume: usize,
+    fs: &'static str,
+    offset: u64,
+    id_kind: &'static str,
+    name: String,
+    ext: String,
+    size: u64,
+    sha256: String,
+    deleted: bool,
+    confidence: &'static str,
+    path: String,
+    created: u64,
+    modified: u64,
+    accessed: u64,
+    deleted_at: u64,
+}
+
+/// Every partition, each with the undelete mode its filesystem calls for.
+///
+/// This is the "point it at the disk" mode: an examination usually starts
+/// without knowing what is on the thing, and running four tools by hand over
+/// four offsets is how a volume gets missed.
+fn run_auto(
+    reader: &Source,
+    opts: &Options,
+    include_live: bool,
+    machine: bool,
+    csv_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::partition;
+
+    // Volumes to try: the whole image if it is one, otherwise the table.
+    let mut volumes: Vec<(usize, u64, &'static str, String)> = Vec::new();
+    let whole = partition::detect_fs(reader, 0);
+    if !whole.is_empty() {
+        volumes.push((0, 0, whole, "whole image".to_string()));
+    }
+    for p in partition::parse(reader) {
+        let fs = if p.fstype.is_empty() {
+            partition::detect_fs(reader, p.start)
+        } else {
+            p.fstype
+        };
+        // Detection can come up empty on a volume whose header is damaged; the
+        // partition type still says what it was meant to hold, and trying is
+        // better than passing over it in silence.
+        let fs = if fs.is_empty() {
+            match p.name.as_str() {
+                "apple-hfs" => "hfs+",
+                "apple-apfs" => "apfs",
+                "linux" | "linux-fs" | "linux-home" => "ext",
+                "NTFS/exFAT" | "basic-data" => "ntfs",
+                n if n.starts_with("FAT") => "fat",
+                _ => "",
+            }
+        } else {
+            fs
+        };
+        if fs.is_empty() {
+            continue;
+        }
+        let label = if p.name.is_empty() {
+            format!("{} #{}", p.scheme, p.index)
+        } else {
+            format!("{} #{} {}", p.scheme, p.index, p.name)
+        };
+        volumes.push((volumes.len(), p.start, fs, label));
+    }
+    if volumes.is_empty() {
+        return Err("no filesystem found to recover from; --list-partitions \
+                    shows what is on this image"
+            .into());
+    }
+
+    let started = Instant::now();
+    let mut all: Vec<AutoRecord> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for (index, base, fs, label) in &volumes {
+        let (index, base, fs) = (*index, *base, *fs);
+        if !opts.quiet {
+            eprintln!("volume {index} at {base:#x}: {fs} ({label})");
+        }
+        // Each volume writes under its own directory, so two volumes holding
+        // the same paths cannot overwrite each other. The filesystem's own name
+        // is the directory below that, which each mode adds itself -- naming it
+        // here as well would only risk disagreeing with what the mode found.
+        let vol_out = std::path::Path::new(&opts.out_dir)
+            .join(format!("volume{index}"))
+            .to_string_lossy()
+            .to_string();
+        let before = all.len();
+        let result = recover_one(
+            reader,
+            base,
+            fs,
+            &vol_out,
+            opts,
+            include_live,
+            index,
+            &mut all,
+        );
+        match result {
+            Ok(()) => {
+                if !opts.quiet {
+                    eprintln!("  {} file(s)", all.len() - before);
+                }
+            }
+            Err(e) => {
+                // One unreadable volume must not end the sweep: the others may
+                // be the ones that matter.
+                if !opts.quiet {
+                    eprintln!("  skipped: {e}");
+                }
+                skipped.push(format!("volume {index} ({fs}): {e}"));
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    if machine {
+        for r in &all {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("file")),
+                    ("volume", json::number(r.volume as u64)),
+                    ("fs", json::string(r.fs)),
+                    ("name", json::string(&r.name)),
+                    ("size", json::number(r.size)),
+                    ("sha256", json::string(&r.sha256)),
+                    ("deleted", json::boolean(r.deleted)),
+                    ("path", json::string(&r.path)),
+                ])
+            );
+        }
+    }
+
+    let files: Vec<String> = all
+        .iter()
+        .map(|r| {
+            json::object(vec![
+                ("volume", json::number(r.volume as u64)),
+                ("fs", json::string(r.fs)),
+                (r.id_kind, json::number(r.offset)),
+                ("name", json::string(&r.name)),
+                ("ext", json::string(&r.ext)),
+                ("size", json::number(r.size)),
+                ("sha256", json::string(&r.sha256)),
+                ("deleted", json::boolean(r.deleted)),
+                ("confidence", json::string(r.confidence)),
+                ("created", json::number(r.created)),
+                ("modified", json::number(r.modified)),
+                ("accessed", json::number(r.accessed)),
+                ("deleted_at", json::number(r.deleted_at)),
+                ("path", json::string(&r.path)),
+            ])
+        })
+        .collect();
+    let vols: Vec<String> = volumes
+        .iter()
+        .map(|(i, base, fs, label)| {
+            json::object(vec![
+                ("index", json::number(*i as u64)),
+                ("offset", json::number(*base)),
+                ("fs", json::string(fs)),
+                ("label", json::string(label)),
+            ])
+        })
+        .collect();
+    let manifest = json::object(vec![
+        ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
+        ("mode", json::string("auto")),
+        ("source", json::string(reader.path())),
+        ("source_size", json::number(reader.size())),
+        ("volumes", json::array(vols)),
+        (
+            "skipped",
+            json::array(skipped.iter().map(|s| json::string(s)).collect()),
+        ),
+        ("elapsed_s", json::float(elapsed)),
+        ("files", json::array(files)),
+    ]);
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
+        let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
+        std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(csv) = csv_path {
+            let mut out = String::from(
+                "volume,fs,id,name,ext,size,sha256,deleted,confidence,created,modified,accessed,deleted_at,path\n",
+            );
+            for r in &all {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    r.volume,
+                    r.fs,
+                    r.offset,
+                    r.name.replace(',', ";"),
+                    r.ext,
+                    r.size,
+                    r.sha256,
+                    r.deleted,
+                    r.confidence,
+                    r.created,
+                    r.modified,
+                    r.accessed,
+                    r.deleted_at,
+                    r.path.replace(',', ";")
+                ));
+            }
+            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        }
+    } else {
+        println!("{manifest}");
+    }
+    if !opts.quiet {
+        let deleted = all.iter().filter(|r| r.deleted).count();
+        eprintln!(
+            "recovered {} file(s) ({deleted} deleted) from {} volume(s) in {elapsed:.2}s",
+            all.len(),
+            volumes.len() - skipped.len()
+        );
+        for note in &skipped {
+            eprintln!("skipped {note}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run one volume through the mode its filesystem calls for.
+#[allow(clippy::too_many_arguments)]
+fn recover_one(
+    reader: &Source,
+    base: u64,
+    fs: &'static str,
+    out_dir: &str,
+    opts: &Options,
+    include_live: bool,
+    index: usize,
+    all: &mut Vec<AutoRecord>,
+) -> Result<(), String> {
+    use breadcrumb_rs::{apfs, ext4, fat, hfs, ntfs};
+
+    match fs {
+        "ntfs" => {
+            let o = ntfs::Options {
+                out_dir: out_dir.to_string(),
+                dry_run: opts.dry_run,
+                include_live,
+                min_size: opts.min_size,
+            };
+            for r in ntfs::recover(reader, base, &o, |_| {})? {
+                let confidence = r.confidence();
+                all.push(AutoRecord {
+                    volume: index,
+                    fs,
+                    offset: r.mft,
+                    id_kind: "mft",
+                    ext: r.ext,
+                    name: r.name,
+                    size: r.size,
+                    sha256: r.sha256,
+                    deleted: r.deleted,
+                    confidence,
+                    path: r.path,
+                    created: r.timestamps.created,
+                    modified: r.timestamps.modified,
+                    accessed: r.timestamps.accessed,
+                    deleted_at: 0,
+                });
+            }
+        }
+        "fat" | "exfat" => {
+            let o = fat::Options {
+                out_dir: out_dir.to_string(),
+                dry_run: opts.dry_run,
+                include_live,
+                min_size: opts.min_size,
+            };
+            let (records, kind, _cluster) = fat::recover(reader, base, &o, |_| {})?;
+            for r in records {
+                let confidence = r.confidence();
+                all.push(AutoRecord {
+                    volume: index,
+                    fs: kind,
+                    offset: r.offset,
+                    id_kind: "entry_offset",
+                    ext: r.ext,
+                    name: r.name,
+                    size: r.size,
+                    sha256: r.sha256,
+                    deleted: r.deleted,
+                    confidence,
+                    path: r.path,
+                    created: r.timestamps.created,
+                    modified: r.timestamps.modified,
+                    accessed: r.timestamps.accessed,
+                    deleted_at: 0,
+                });
+            }
+        }
+        "ext" => {
+            let o = ext4::Options {
+                out_dir: out_dir.to_string(),
+                dry_run: opts.dry_run,
+                include_live,
+                min_size: opts.min_size,
+            };
+            let (records, _summary) = ext4::recover(reader, base, &o, |_| {})?;
+            for r in records {
+                let confidence = r.confidence();
+                all.push(AutoRecord {
+                    volume: index,
+                    fs: "ext4",
+                    offset: r.inode,
+                    id_kind: "inode",
+                    ext: r.ext,
+                    name: r.name,
+                    size: r.size,
+                    sha256: r.sha256,
+                    deleted: r.deleted,
+                    confidence,
+                    path: r.path,
+                    created: 0,
+                    modified: r.timestamps.modified,
+                    accessed: r.timestamps.accessed,
+                    deleted_at: r.timestamps.deleted,
+                });
+            }
+        }
+        "hfs+" => {
+            let o = hfs::Options {
+                out_dir: out_dir.to_string(),
+                dry_run: opts.dry_run,
+                include_live,
+                min_size: opts.min_size,
+                scan_volume: true,
+            };
+            let (records, _summary) = hfs::recover(reader, base, &o, |_| {})?;
+            for r in records {
+                let confidence = r.confidence();
+                all.push(AutoRecord {
+                    volume: index,
+                    fs,
+                    offset: r.cnid,
+                    id_kind: "cnid",
+                    ext: r.ext,
+                    name: r.name,
+                    size: r.size,
+                    sha256: r.sha256,
+                    deleted: r.deleted,
+                    confidence,
+                    path: r.path,
+                    created: r.timestamps.created,
+                    modified: r.timestamps.modified,
+                    accessed: r.timestamps.accessed,
+                    deleted_at: 0,
+                });
+            }
+        }
+        "apfs" => {
+            let o = apfs::Options {
+                out_dir: out_dir.to_string(),
+                dry_run: opts.dry_run,
+                min_size: opts.min_size,
+            };
+            let (records, _summary) = apfs::recover(reader, base, &o, |_| {})?;
+            for r in records {
+                let confidence = r.confidence();
+                all.push(AutoRecord {
+                    volume: index,
+                    fs,
+                    offset: r.file_id,
+                    id_kind: "file_id",
+                    ext: r.ext,
+                    name: r.name,
+                    size: r.size,
+                    sha256: r.sha256,
+                    // Every APFS object is a past state; there is no live set
+                    // to compare against.
+                    deleted: true,
+                    confidence,
+                    path: r.path,
+                    created: r.timestamps.created,
+                    modified: r.timestamps.modified,
+                    accessed: r.timestamps.accessed,
+                    deleted_at: 0,
+                });
+            }
+        }
+        "bitlocker" => {
+            return Err("BitLocker volume: pass a key (--bitlocker-recovery-key, \
+                        --bitlocker-password, --bitlocker-bek or --bitlocker-fvek) \
+                        and the volume will be unlocked before this runs"
+                .into())
+        }
+        other => return Err(format!("no undelete mode for {other}")),
+    }
+    Ok(())
 }
 
 /// Deletion times, which carving and the MFT alone cannot give.

@@ -117,6 +117,26 @@ directory, then the EOCD — never by searching forward for a trailing
 carves everything in between. An archive that cannot be resolved is bounded by
 the members actually accounted for and reported unvalidated.
 
+## A whole disk in one pass
+
+An examination usually starts without knowing what is on the thing, and running
+four modes by hand over four offsets is how a volume gets missed.
+
+```sh
+bcrumb-rs disk.E01 --auto -o out --csv files.csv
+```
+
+`--auto` reads the partition table, identifies each volume's filesystem, and
+runs the mode that filesystem calls for — NTFS, FAT/exFAT, ext, HFS+ or APFS —
+writing each volume's recoveries under `out/volume<N>/`. One CSV and one
+manifest cover the disk, with a `volume` and `fs` column on every row.
+
+A volume that cannot be read does not end the sweep: it is reported as skipped,
+by name and reason, in the manifest and on the way out. Volumes are listed in
+the manifest whether or not they yielded anything, so the record says what was
+covered rather than only what was found. A BitLocker volume is unlocked first if
+a key was given, and named as skipped if not.
+
 ## NTFS undelete
 
 Carving finds file *content* by its bytes, which is why every carved file is
@@ -348,9 +368,6 @@ bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 
 Named so an examination is not planned around something that is not here:
 
-- **`--auto` whole-disk sweep** — the mode that detects every partition's
-  filesystem and runs the right undelete over each in one pass. The individual
-  modes are all here; `--list-partitions` shows what to point them at
 - **ext4 journal replay** — where a freed inode's extent tree has been cleared,
   the journal may still hold the pre-delete inode. `--ext4` reports how many
   files are in that state; it does not replay the journal to get them back

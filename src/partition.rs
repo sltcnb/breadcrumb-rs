@@ -6,6 +6,7 @@
 
 use crate::reader::Source;
 
+#[derive(Debug, Clone)]
 pub struct Partition {
     pub index: usize,
     pub scheme: &'static str,
@@ -119,8 +120,10 @@ pub fn detect_fs(src: &Source, offset: u64) -> &'static str {
     if sb.len() >= 58 && u16le(&sb, 56) == 0xEF53 {
         return "ext";
     }
+    // HFS+/HFSX: the volume header is 1024 bytes into the volume, which is
+    // past `head` -- reading only the first sector finds nothing.
     if matches!(&head[..4], b"H+\x00\x04" | b"HX\x00\x05")
-        || (head.len() >= 1026 && matches!(&head[1024..1026], b"H+" | b"HX"))
+        || matches!(&sb[..2.min(sb.len())], b"H+" | b"HX")
     {
         return "hfs+";
     }
