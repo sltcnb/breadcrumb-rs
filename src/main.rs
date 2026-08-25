@@ -53,6 +53,8 @@ options:
                           content from inodes whose map survived
       --hfs               HFS+/HFSX undelete: catalog B-tree walk, including
                           records left outside the live tree
+      --apfs              APFS recovery: scan for superseded copy-on-write
+                          objects, which is where deleted files survive
       --include-live      with an undelete mode, also recover files in use
       --deleted-times     when files were deleted, from $Recycle.Bin/$I records
                           and the $UsnJrnl change journal (writes deletions.csv)
@@ -111,6 +113,8 @@ by scenario
     bcrumb-rs disk.dd --ext4 -o out --csv files.csv
   an older Mac volume (HFS+)
     bcrumb-rs disk.dd --hfs -o out --csv files.csv
+  a Mac volume (APFS): superseded objects hold the deleted files
+    bcrumb-rs disk.dd --apfs -o out --csv files.csv
   when files were deleted (recycle bin + change journal)
     bcrumb-rs disk.E01 --deleted-times -o out
   ...from artefacts already pulled off a machine
@@ -322,6 +326,7 @@ fn run() -> Result<ExitCode, String> {
     let mut fat_mode = false;
     let mut ext_mode = false;
     let mut hfs_mode = false;
+    let mut apfs_mode = false;
     let mut include_live = false;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
@@ -403,6 +408,7 @@ fn run() -> Result<ExitCode, String> {
             "--fat" | "--exfat" => fat_mode = true,
             "--ext4" | "--ext" => ext_mode = true,
             "--hfs" | "--hfsplus" => hfs_mode = true,
+            "--apfs" => apfs_mode = true,
             "--include-live" => include_live = true,
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
@@ -629,6 +635,10 @@ fn run() -> Result<ExitCode, String> {
 
     if hfs_mode {
         return run_hfs(&reader, &opts, include_live, machine, csv_path.as_deref());
+    }
+
+    if apfs_mode {
+        return run_apfs(&reader, &opts, machine, csv_path.as_deref());
     }
 
     if list_partitions {
@@ -1318,6 +1328,131 @@ fn run_hfs(
             "recovered {} file(s) ({deleted} deleted) from HFS+ in {elapsed:.2}s",
             records.len()
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// APFS recovery from superseded copy-on-write objects.
+///
+/// There is no live/deleted split here: the objects come from every version the
+/// container still holds, so everything found is a record of some past state.
+fn run_apfs(
+    reader: &Source,
+    opts: &Options,
+    machine: bool,
+    csv_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::apfs;
+
+    let started = Instant::now();
+    let quiet = opts.quiet;
+    let aopts = apfs::Options {
+        out_dir: opts.out_dir.clone(),
+        dry_run: opts.dry_run,
+        min_size: opts.min_size,
+    };
+    let (records, summary) = apfs::recover(reader, opts.start, &aopts, |rec| {
+        if machine {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("file")),
+                    ("name", json::string(&rec.name)),
+                    ("file_id", json::number(rec.file_id)),
+                    ("size", json::number(rec.size)),
+                    ("sha256", json::string(&rec.sha256)),
+                    ("validated", json::boolean(rec.validated)),
+                    ("created", json::number(rec.timestamps.created)),
+                    ("modified", json::number(rec.timestamps.modified)),
+                    ("path", json::string(&rec.path)),
+                ])
+            );
+        } else if !quiet {
+            eprintln!(
+                "[+] {}  {} B{}",
+                rec.name,
+                rec.size,
+                if rec.validated {
+                    ""
+                } else {
+                    "  (low confidence: partial extent map or no name)"
+                }
+            );
+        }
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let files: Vec<String> = records
+        .iter()
+        .map(|r| {
+            json::object(vec![
+                ("type", json::string("apfs")),
+                ("ext", json::string(&r.ext)),
+                ("file_id", json::number(r.file_id)),
+                ("name", json::string(&r.name)),
+                ("size", json::number(r.size)),
+                ("sha256", json::string(&r.sha256)),
+                ("validated", json::boolean(r.validated)),
+                ("confidence", json::string(r.confidence())),
+                ("created", json::number(r.timestamps.created)),
+                ("modified", json::number(r.timestamps.modified)),
+                ("accessed", json::number(r.timestamps.accessed)),
+                ("path", json::string(&r.path)),
+            ])
+        })
+        .collect();
+    let manifest = json::object(vec![
+        ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
+        ("mode", json::string("apfs")),
+        ("source", json::string(reader.path())),
+        ("source_size", json::number(reader.size())),
+        ("volume_size", json::number(summary.volume_size)),
+        ("block_size", json::number(summary.block_size)),
+        ("fstree_nodes", json::number(summary.nodes_found)),
+        ("unnamed", json::number(summary.unnamed)),
+        ("elapsed_s", json::float(elapsed)),
+        ("files", json::array(files)),
+    ]);
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
+        let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
+        std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(csv) = csv_path {
+            let mut out = String::from(
+                "file_id,name,ext,size,sha256,confidence,created,modified,accessed,path\n",
+            );
+            for r in &records {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{}\n",
+                    r.file_id,
+                    r.name.replace(',', ";"),
+                    r.ext,
+                    r.size,
+                    r.sha256,
+                    r.confidence(),
+                    r.timestamps.created,
+                    r.timestamps.modified,
+                    r.timestamps.accessed,
+                    r.path.replace(',', ";")
+                ));
+            }
+            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        }
+    } else {
+        println!("{manifest}");
+    }
+    if !opts.quiet {
+        eprintln!(
+            "recovered {} file(s) from {} FS-tree node(s) in {elapsed:.2}s",
+            records.len(),
+            summary.nodes_found
+        );
+        if summary.unnamed > 0 {
+            eprintln!(
+                "note: {} file(s) had extents but no name anywhere on the container",
+                summary.unnamed
+            );
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

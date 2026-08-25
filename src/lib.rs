@@ -5,6 +5,7 @@
 //! its true end, and write the recovered bytes out with a SHA-256 manifest.
 //! No filesystem metadata is needed or consulted.
 
+pub mod apfs;
 pub mod artifacts;
 pub mod bitlocker;
 pub mod carver;

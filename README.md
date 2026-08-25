@@ -212,6 +212,32 @@ files deleted that way, 0 names were still anywhere on the volume. When that is
 what happened, this mode has nothing to work with and carving is the only route
 left — the file's *content* usually is still there.
 
+## APFS recovery
+
+```sh
+bcrumb-rs disk.dd --apfs -o out --csv files.csv
+```
+
+APFS never overwrites metadata in place. Every change writes new B-tree nodes
+and leaves the old ones until the space is reused, so the filesystem-tree leaf
+that described a deleted file is usually still on the disk as a superseded copy.
+This scans every block for FS-tree leaf nodes, confirms each by its Fletcher-64
+checksum, and joins the records across all the versions it finds:
+
+| record | gives |
+| --- | --- |
+| `DIR_REC` | parent id + name → file id, so paths can be rebuilt |
+| `INODE` | logical size and timestamps |
+| `FILE_EXTENT` | logical offset → physical block and length |
+
+There is no live/deleted distinction here, and the tool does not invent one:
+every object found is a record of some past state of the container, so a file
+that was never deleted comes back alongside one that was.
+
+Not decoded: compressed and encrypted streams, and inline data held in an
+extended attribute instead of extents. A file whose extent map is incomplete is
+written with the gaps zero-filled and reported at low confidence.
+
 ## When files were deleted
 
 NTFS records four timestamps per file and none of them is "deleted": the MFT
@@ -313,8 +339,9 @@ bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 This is the carving core only. For any of the following, use the Python
 implementation — it remains the reference and the more complete tool:
 
-- **APFS undelete** — NTFS, FAT/exFAT, ext2/3/4 and HFS+ are done (above);
-  APFS and the `--auto` whole-disk sweep are not ported yet
+- **`--auto` whole-disk sweep** — the mode that detects every partition's
+  filesystem and runs the right undelete over each in one pass. The individual
+  modes are all here; `--list-partitions` shows what to point them at
 - **ext4 journal replay** — where a freed inode's extent tree has been cleared,
   the journal may still hold the pre-delete inode. `--ext4` reports how many
   files are in that state; it does not replay the journal to get them back
