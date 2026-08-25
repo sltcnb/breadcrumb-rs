@@ -37,6 +37,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release
 
+  fuzz:
+    # The mutation fuzz runs with the normal tests; this job additionally
+    # checks the cargo-fuzz targets still build, so a long campaign can be
+    # started at any time without first fixing the harness.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build the fuzz targets
+        run: cargo fuzz build
+      - name: Short campaign on each target
+        run: |
+          for t in handlers ewf fve artifacts; do
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
+          done
+
   msrv:
     runs-on: ubuntu-latest
     steps:

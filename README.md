@@ -201,6 +201,25 @@ ciphertext and reporting "0 files" is indistinguishable from an empty disk.
 TPM-only protectors cannot be unlocked from an image by any tool: the key is
 sealed in hardware. Use the recovery key, a `.BEK`, or the FVEK.
 
+## Fuzzing
+
+Every handler parses structures that come off a disk of unknown provenance:
+sizes, offsets and counts are all attacker-controlled in practice. Two layers
+cover that:
+
+- `tests/fuzz_smoke.rs` runs on stable in ordinary CI. Valid files are mutated —
+  bytes flipped, length fields made absurd, tails truncated, files spliced onto
+  themselves — and every handler runs over the result. A handler may reject
+  anything, but it must not panic, must not take seconds on a few KB, and must
+  never report a carve reaching past its window.
+- `fuzz/` holds cargo-fuzz targets (`handlers`, `ewf`, `fve`, `artifacts`) for
+  longer campaigns, built in CI and run for a minute each.
+
+The invariant is also enforced centrally in the scan engine: a carve larger than
+its window is rejected, so one arithmetic slip in one of 28 parsers cannot write
+unrelated disk into evidence. The first run of the mutation fuzz found exactly
+that — a corrupted PNG chunk length yielding 16 KB from an 80-byte window.
+
 ## Verifying the image first
 
 EWF stores the MD5, and usually the SHA-1, computed while the disk was read.

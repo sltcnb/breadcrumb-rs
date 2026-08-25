@@ -312,6 +312,14 @@ impl<'a> Carver<'a> {
             self.rejected += 1;
             return None;
         }
+        // A handler must not report more than its window holds -- the bytes
+        // past the end are not the file. Enforced here as well as in each
+        // handler, so one arithmetic slip in one of 28 parsers cannot write
+        // unrelated disk into evidence.
+        if carve.size > cap {
+            self.rejected += 1;
+            return None;
+        }
 
         // Hash while streaming; write as we go unless this is a dry run.
         let mut hasher = Sha256::new();

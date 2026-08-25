@@ -2,3 +2,6 @@
 Cargo.lock.orig
 *.img
 carved/
+fuzz/target
+fuzz/corpus
+fuzz/artifacts

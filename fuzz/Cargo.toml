@@ -1,0 +1,39 @@
+[package]
+name = "breadcrumb-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.breadcrumb-rs]
+path = ".."
+
+[[bin]]
+name = "handlers"
+path = "fuzz_targets/handlers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ewf"
+path = "fuzz_targets/ewf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fve"
+path = "fuzz_targets/fve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "artifacts"
+path = "fuzz_targets/artifacts.rs"
+test = false
+doc = false

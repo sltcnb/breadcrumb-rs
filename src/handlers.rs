@@ -150,6 +150,9 @@ pub fn carve_png(w: &mut Window) -> Option<Carve> {
             return None;
         }
         pos += 12 + length;
+        if pos > w.limit {
+            return None; // a chunk length that runs off the end: truncated
+        }
         if ctype == b"IEND" {
             return carve(pos, "png", true);
         }
