@@ -46,3 +46,6 @@ panic = "abort"
 
 [dev-dependencies]
 md-5 = "0.10"
+# Test fixtures are real filesystem images, stored gzipped: most of a volume is
+# zeros, and the repository should not carry tens of megabytes of them.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }

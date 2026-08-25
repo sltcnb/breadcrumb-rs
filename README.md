@@ -133,6 +133,32 @@ skipped rather than written out as garbage, and a file whose clusters have been
 reused since deletion comes back with whatever is there now, flagged low
 confidence — never silently.
 
+## FAT and exFAT undelete
+
+A camera card, a USB stick, most removable media:
+
+```sh
+bcrumb-rs card.dd --fat -o out --csv files.csv
+```
+
+A deleted FAT entry keeps everything except its allocation chain: the size, the
+start cluster and the timestamps are all still there, and only the first
+character of the short name is overwritten with `0xE5` (shown as `_`). Long
+names usually survive in the entries preceding it.
+
+What is gone is the list of clusters after the first, so a file that was
+contiguous is recovered exactly and one that was fragmented is recovered as the
+bytes that follow its first cluster. Nothing in the filesystem distinguishes the
+two, so the tool says so — in the manifest and on the way out — rather than
+implying more than it knows.
+
+exFAT is in better shape: deletion clears an in-use bit, so the full name and
+the data length survive, and the format records outright whether a file was
+contiguous.
+
+Deleted files inside live directories are found too: the directory's own chain
+is intact, so it can be walked to reach the entries in it.
+
 ## When files were deleted
 
 NTFS records four timestamps per file and none of them is "deleted": the MFT
@@ -234,8 +260,8 @@ bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 This is the carving core only. For any of the following, use the Python
 implementation — it remains the reference and the more complete tool:
 
-- **ext4 / FAT / HFS+ / APFS undelete** — NTFS is done (above); the others and
-  the `--auto` whole-disk sweep are not ported yet
+- **ext4 / HFS+ / APFS undelete** — NTFS and FAT/exFAT are done (above); the
+  others and the `--auto` whole-disk sweep are not ported yet
 - **VHD/VHDX, Ex01/EWF2, L01, AFF.** Raw images, block devices, EWF
   (`.E01`/`.s01`) sets, QCOW2, sparse VMDK, split raw and stdin are all read
   here; what is left is refused outright, by magic and by extension, because

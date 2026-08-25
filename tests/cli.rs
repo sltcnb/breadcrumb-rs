@@ -270,7 +270,7 @@ fn reports_can_be_written_from_a_manifest_without_the_image() {
 
     let exe = env!("CARGO_BIN_EXE_bcrumb-rs");
     let scan = std::process::Command::new(exe)
-        .args([&img.to_string_lossy().to_string(), "-t", "png", "-o"])
+        .args([img.to_string_lossy().as_ref(), "-t", "png", "-o"])
         .arg(&out)
         .arg("-q")
         .output()

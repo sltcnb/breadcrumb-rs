@@ -47,7 +47,9 @@ options:
                           decode
       --ntfs              NTFS undelete: walk the MFT for deleted files,
                           recovering names, paths and timestamps
-      --include-live      with --ntfs, also recover files still in use
+      --fat               FAT12/16/32 or exFAT undelete: recover deleted
+                          directory entries (names, sizes, timestamps)
+      --include-live      with --ntfs or --fat, also recover files in use
       --deleted-times     when files were deleted, from $Recycle.Bin/$I records
                           and the $UsnJrnl change journal (writes deletions.csv)
       --usn-all           with --deleted-times, report every journal reason,
@@ -99,6 +101,8 @@ by scenario
     bcrumb-rs disk.E01 -t office -o out --bitlocker-recovery-key 650441-...-609257
   filenames, paths and timestamps instead of bytes (NTFS)
     bcrumb-rs disk.E01 --ntfs -o out --csv files.csv
+  a camera card or USB stick (FAT / exFAT)
+    bcrumb-rs card.dd --fat -o out --csv files.csv
   when files were deleted (recycle bin + change journal)
     bcrumb-rs disk.E01 --deleted-times -o out
   ...from artefacts already pulled off a machine
@@ -307,6 +311,7 @@ fn run() -> Result<ExitCode, String> {
     let mut verify = false;
     let mut resume = false;
     let mut ntfs_mode = false;
+    let mut fat_mode = false;
     let mut include_live = false;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
@@ -385,6 +390,7 @@ fn run() -> Result<ExitCode, String> {
                 opts.drop_failed = true;
             }
             "--ntfs" => ntfs_mode = true,
+            "--fat" | "--exfat" => fat_mode = true,
             "--include-live" => include_live = true,
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
@@ -599,6 +605,10 @@ fn run() -> Result<ExitCode, String> {
 
     if ntfs_mode {
         return run_ntfs(&reader, &opts, include_live, machine, csv_path.as_deref());
+    }
+
+    if fat_mode {
+        return run_fat(&reader, &opts, include_live, machine, csv_path.as_deref());
     }
 
     if list_partitions {
@@ -895,6 +905,146 @@ fn run_from_manifest(
     }
     if !opts.quiet {
         eprintln!("{} record(s) from {manifest}", records.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// FAT and exFAT undelete.
+///
+/// A deleted FAT entry keeps its size, start cluster and timestamps; what it
+/// loses is the allocation chain, so a file that was fragmented cannot be
+/// reassembled and comes back as whatever follows its first cluster. That is
+/// stated in the output rather than hidden: see the note printed at the end.
+fn run_fat(
+    reader: &Source,
+    opts: &Options,
+    include_live: bool,
+    machine: bool,
+    csv_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::fat;
+
+    let started = Instant::now();
+    let quiet = opts.quiet;
+    let fopts = fat::Options {
+        out_dir: opts.out_dir.clone(),
+        dry_run: opts.dry_run,
+        include_live,
+        min_size: opts.min_size,
+    };
+    let (records, kind, cluster_size) = fat::recover(reader, opts.start, &fopts, |rec| {
+        if machine {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("file")),
+                    ("name", json::string(&rec.name)),
+                    ("offset", json::number(rec.offset)),
+                    ("size", json::number(rec.size)),
+                    ("sha256", json::string(&rec.sha256)),
+                    ("deleted", json::boolean(rec.deleted)),
+                    ("validated", json::boolean(rec.validated)),
+                    ("created", json::number(rec.timestamps.created)),
+                    ("modified", json::number(rec.timestamps.modified)),
+                    ("accessed", json::number(rec.timestamps.accessed)),
+                    ("path", json::string(&rec.path)),
+                ])
+            );
+        } else if !quiet {
+            eprintln!(
+                "[+] {}  {} B{}",
+                rec.name,
+                rec.size,
+                if rec.validated {
+                    ""
+                } else {
+                    "  (short read: the file ran past the volume)"
+                }
+            );
+        }
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let files: Vec<String> = records
+        .iter()
+        .map(|r| {
+            json::object(vec![
+                ("type", json::string(r.kind)),
+                ("ext", json::string(&r.ext)),
+                ("name", json::string(&r.name)),
+                ("offset", json::number(r.offset)),
+                ("size", json::number(r.size)),
+                ("sha256", json::string(&r.sha256)),
+                ("deleted", json::boolean(r.deleted)),
+                ("validated", json::boolean(r.validated)),
+                ("confidence", json::string(r.confidence())),
+                ("created", json::number(r.timestamps.created)),
+                ("modified", json::number(r.timestamps.modified)),
+                ("accessed", json::number(r.timestamps.accessed)),
+                ("path", json::string(&r.path)),
+            ])
+        })
+        .collect();
+    let manifest = json::object(vec![
+        ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
+        ("mode", json::string(kind)),
+        ("source", json::string(reader.path())),
+        ("source_size", json::number(reader.size())),
+        ("cluster_size", json::number(cluster_size)),
+        ("elapsed_s", json::float(elapsed)),
+        (
+            "note",
+            json::string(
+                "FAT frees the allocation chain on delete, so a file that was \
+                 fragmented is recovered as the bytes following its first \
+                 cluster. Contiguous files are exact.",
+            ),
+        ),
+        ("files", json::array(files)),
+    ]);
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
+        let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
+        std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(csv) = csv_path {
+            let mut out = String::from(
+                "name,ext,offset,size,sha256,deleted,confidence,created,modified,accessed,path\n",
+            );
+            for r in &records {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}\n",
+                    r.name.replace(',', ";"),
+                    r.ext,
+                    r.offset,
+                    r.size,
+                    r.sha256,
+                    r.deleted,
+                    r.confidence(),
+                    r.timestamps.created,
+                    r.timestamps.modified,
+                    r.timestamps.accessed,
+                    r.path.replace(',', ";")
+                ));
+            }
+            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        }
+    } else {
+        println!("{manifest}");
+    }
+    if !opts.quiet {
+        let deleted = records.iter().filter(|r| r.deleted).count();
+        eprintln!(
+            "recovered {} file(s) ({deleted} deleted) from {} in {elapsed:.2}s",
+            records.len(),
+            kind.to_uppercase()
+        );
+        if deleted > 0 {
+            eprintln!(
+                "note: {} frees the allocation chain on delete, so a file that was \
+                 fragmented comes back as the bytes after its first cluster",
+                kind.to_uppercase()
+            );
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
