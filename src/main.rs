@@ -37,6 +37,8 @@ options:
       --grep PATTERN      search the source for a string instead of carving
                           (repeatable; both ASCII and UTF-16LE are matched)
   -i, --ignore-case       case-insensitive --grep
+  -E, --regex             treat --grep patterns as regular expressions (matched
+                          against the bytes; literals also match UTF-16LE)
       --max-hits N        stop after N --grep hits
       --validate          decode each carved file to confirm it is intact, not
                           only well formed (PNG/ZIP+OOXML/gzip CRCs, JPEG and
@@ -54,6 +56,11 @@ options:
                           (the source may also be a folder of already-extracted
                           $I / $UsnJrnl files rather than an image)
       --list-partitions   print the partition table and detected filesystems
+      --sig-file FILE     add signatures defined in a JSON file (see README)
+      --only-custom       carve only the --sig-file signatures
+      --from-manifest FILE
+                          write the reports below from an existing manifest,
+                          without rescanning the image
       --csv FILE          write a CSV of the carve results
       --bodyfile FILE     write a Sleuth Kit bodyfile
       --timeline FILE     write a timeline CSV
@@ -104,8 +111,14 @@ by scenario
     bcrumb-rs disk.E01 -j 0 -o /mnt/scratch/out
   find a keyword, in ASCII and UTF-16LE
     bcrumb-rs disk.E01 --grep secret-project --max-hits 50
+  ...or a pattern: card numbers, IBANs, anything with a shape
+    bcrumb-rs disk.E01 --regex --grep \"[0-9]{4}([ -]?[0-9]{4}){3}\"
   only files that actually decode (fragmented carves fail here)
     bcrumb-rs disk.dd -t office,jpg -o out --validate --drop-failed
+  reports from a scan that already ran
+    bcrumb-rs --from-manifest out/manifest.json --html report.html
+  a format the tool does not know, by magic and footer
+    bcrumb-rs disk.dd --sig-file mysigs.json --only-custom -o out
   a case file: CSV, timeline, HTML report and a custody hash
     bcrumb-rs disk.dd -o out --csv files.csv --timeline t.csv --html r.html --hash-source
   read from a pipe (spooled to a temp file, since handlers seek)
@@ -145,53 +158,68 @@ fn plan_ranges(
     out
 }
 
+/// Read the records out of a manifest written by an earlier run.
+fn records_from_manifest(path: &std::path::Path) -> Result<Vec<Record>, String> {
+    use breadcrumb_rs::jsonin::{self, Value};
+
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = jsonin::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let files = match doc.get("files").and_then(Value::as_array) {
+        Some(f) => f,
+        None => return Err(format!("{}: no \"files\" list", path.display())),
+    };
+    let mut out = Vec::new();
+    for f in files {
+        let num = |k: &str| f.get(k).and_then(Value::as_f64).map(|n| n as u64);
+        let text = |k: &str| f.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let (Some(offset), Some(size)) = (num("offset"), num("size")) else {
+            continue;
+        };
+        out.push(Record {
+            // The registry owns the built-in names; a manifest's are read at
+            // run time, so they are leaked to match the &'static in Record.
+            kind: Box::leak(text("type").into_boxed_str()),
+            ext: Box::leak(
+                match f.get("ext").and_then(Value::as_str) {
+                    Some(e) if !e.is_empty() => e.to_string(),
+                    _ => "bin".to_string(),
+                }
+                .into_boxed_str(),
+            ),
+            offset,
+            size,
+            sha256: text("sha256"),
+            validated: f.get("validated").and_then(Value::as_bool).unwrap_or(false),
+            path: text("path"),
+            duplicate_of: num("duplicate_of"),
+            decoded: f.get("decoded").and_then(Value::as_bool),
+        });
+    }
+    Ok(out)
+}
+
 /// Fold records from a previous attempt's manifest into this run's, so a
 /// resumed scan reports the whole image rather than only the part it did.
 fn merge_with_existing(out_dir: &str, mut records: Vec<Record>) -> Vec<Record> {
     let path = std::path::Path::new(out_dir).join("manifest.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(earlier) = records_from_manifest(&path) else {
         return records;
     };
-    // The manifest is ours and its shape is fixed, so the fields are pulled out
-    // directly rather than pulling in a JSON parser for one use.
     let mut recovered = 0usize;
-    for line in text.lines() {
-        let get = |key: &str| -> Option<&str> {
-            let at = line.find(&format!("\"{key}\": "))? + key.len() + 4;
-            let rest = &line[at..];
-            let end = rest.find(',').unwrap_or(rest.len());
-            Some(rest[..end].trim().trim_matches('"'))
-        };
-        let (Some(off), Some(size), Some(sha)) = (get("offset"), get("size"), get("sha256")) else {
-            continue;
-        };
-        let (Ok(offset), Ok(size)) = (off.parse::<u64>(), size.parse::<u64>()) else {
-            continue;
-        };
-        if records.iter().any(|r| r.offset == offset && r.size == size) {
+    for rec in earlier {
+        if records
+            .iter()
+            .any(|r| r.offset == rec.offset && r.size == rec.size)
+        {
             continue;
         }
-        records.push(Record {
-            kind: "carved",
-            ext: get("ext").unwrap_or("bin").to_string().leak(),
-            offset,
-            size,
-            sha256: sha.to_string(),
-            validated: get("validated") == Some("true"),
-            path: get("path").unwrap_or("").to_string(),
-            duplicate_of: None,
-            decoded: match get("decoded") {
-                Some("true") => Some(true),
-                Some("false") => Some(false),
-                _ => None,
-            },
-        });
+        records.push(rec);
         recovered += 1;
     }
     if recovered > 0 {
         eprintln!("resumed: carried {recovered} record(s) forward from the earlier manifest");
     }
-    records.sort_by_key(|r| (r.offset, r.size));
+    records.sort_by_key(|r| r.offset);
     records
 }
 
@@ -280,6 +308,10 @@ fn run() -> Result<ExitCode, String> {
     let mut resume = false;
     let mut ntfs_mode = false;
     let mut include_live = false;
+    let mut grep_regex = false;
+    let mut sig_file: Option<String> = None;
+    let mut only_custom = false;
+    let mut from_manifest: Option<String> = None;
     let mut deleted_times = false;
     let mut usn_all = false;
     let mut events_path: Option<String> = None;
@@ -339,10 +371,14 @@ fn run() -> Result<ExitCode, String> {
             "--min-free" => opts.min_free = parse_size(&next(&mut i)?)?,
             "--grep" => grep_patterns.push(next(&mut i)?),
             "-i" | "--ignore-case" => ignore_case = true,
+            "--regex" | "-E" => grep_regex = true,
             "--max-hits" => {
                 let v = next(&mut i)?;
                 max_hits = v.parse().map_err(|_| format!("not a number: {v:?}"))?;
             }
+            "--sig-file" => sig_file = Some(next(&mut i)?),
+            "--only-custom" => only_custom = true,
+            "--from-manifest" => from_manifest = Some(next(&mut i)?),
             "--validate" => opts.validate = true,
             "--drop-failed" => {
                 opts.validate = true;
@@ -418,6 +454,19 @@ fn run() -> Result<ExitCode, String> {
         i += 1;
     }
 
+    // Writing reports from a manifest needs no image, and must work when the
+    // evidence is not attached any more.
+    if let Some(manifest) = &from_manifest {
+        return run_from_manifest(
+            manifest,
+            &opts,
+            csv_path.as_deref(),
+            bodyfile_path.as_deref(),
+            timeline_path.as_deref(),
+            html_path.as_deref(),
+        );
+    }
+
     let source = match source {
         Some(s) => s,
         None => {
@@ -426,10 +475,23 @@ fn run() -> Result<ExitCode, String> {
         }
     };
 
-    let sigs: Vec<&'static Signature> = match &types {
+    let mut sigs: Vec<&'static Signature> = match &types {
         Some(spec) => resolve_types(spec)?,
         None => SIGNATURES.iter().collect(),
     };
+    if let Some(path) = &sig_file {
+        let custom = breadcrumb_rs::customsig::load(path)?;
+        if !opts.quiet {
+            eprintln!("loaded {} custom signature(s) from {path}", custom.len());
+        }
+        if only_custom {
+            sigs = custom;
+        } else {
+            sigs.extend(custom);
+        }
+    } else if only_custom {
+        return Err("--only-custom needs --sig-file".into());
+    }
     if sigs.is_empty() {
         return Err("no signatures selected".into());
     }
@@ -547,34 +609,32 @@ fn run() -> Result<ExitCode, String> {
 
     if !grep_patterns.is_empty() {
         let mut count = 0usize;
-        breadcrumb_rs::grep::search(
-            &reader,
-            &grep_patterns,
-            opts.start,
-            opts.length,
+        let query = breadcrumb_rs::grep::Query {
+            patterns: grep_patterns.clone(),
             ignore_case,
+            regex: grep_regex,
             max_hits,
-            |h| {
-                count += 1;
-                if machine {
-                    println!(
-                        "{}",
-                        json::object(vec![
-                            ("event", json::string("hit")),
-                            ("offset", json::number(h.offset)),
-                            ("pattern", json::string(&h.pattern)),
-                            ("encoding", json::string(h.encoding)),
-                            ("context", json::string(&h.context)),
-                        ])
-                    );
-                } else {
-                    println!(
-                        "{:#014x}  {:<9} {:?}: {}",
-                        h.offset, h.encoding, h.pattern, h.context
-                    );
-                }
-            },
-        );
+        };
+        breadcrumb_rs::grep::search(&reader, &query, opts.start, opts.length, |h| {
+            count += 1;
+            if machine {
+                println!(
+                    "{}",
+                    json::object(vec![
+                        ("event", json::string("hit")),
+                        ("offset", json::number(h.offset)),
+                        ("pattern", json::string(&h.pattern)),
+                        ("encoding", json::string(h.encoding)),
+                        ("context", json::string(&h.context)),
+                    ])
+                );
+            } else {
+                println!(
+                    "{:#014x}  {:<9} {:?}: {}",
+                    h.offset, h.encoding, h.pattern, h.context
+                );
+            }
+        })?;
         if !opts.quiet && !machine {
             eprintln!("\n{count} hit(s)");
         }
@@ -779,6 +839,66 @@ fn run() -> Result<ExitCode, String> {
 /// deleted file, its name, directory path and four timestamps come back with
 /// it, and a fragmented file is reassembled from its runlist instead of being
 /// carved as its first fragment plus junk.
+/// Derived reports from a manifest an earlier scan wrote.
+///
+/// The carved files and the image may be long gone; the manifest is the record,
+/// and a case often needs a report in a different shape later.
+fn run_from_manifest(
+    manifest: &str,
+    opts: &Options,
+    csv_path: Option<&str>,
+    bodyfile_path: Option<&str>,
+    timeline_path: Option<&str>,
+    html_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    let path = std::path::Path::new(manifest);
+    let records = records_from_manifest(path)?;
+    if records.is_empty() {
+        return Err(format!("{manifest}: no carve records in it"));
+    }
+    if csv_path.is_none()
+        && bodyfile_path.is_none()
+        && timeline_path.is_none()
+        && html_path.is_none()
+    {
+        return Err(
+            "--from-manifest needs a report to write: --csv, --bodyfile, --timeline or --html"
+                .into(),
+        );
+    }
+    let source = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| {
+            breadcrumb_rs::jsonin::parse(&t)
+                .ok()
+                .and_then(|d| d.get("source").and_then(|v| v.as_str()).map(str::to_string))
+        })
+        .unwrap_or_else(|| manifest.to_string());
+    let total: u64 = records.iter().map(|r| r.size).sum();
+    for (out, body) in [
+        (csv_path, report::csv(&records)),
+        (bodyfile_path, report::bodyfile(&records)),
+        (timeline_path, report::timeline(&records)),
+        (html_path, report::html(&source, total, &records, 0.0)),
+    ] {
+        if let Some(out) = out {
+            if let Some(parent) = std::path::Path::new(out).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            std::fs::write(out, body).map_err(|e| format!("{out}: {e}"))?;
+            if !opts.quiet {
+                eprintln!("wrote {out}");
+            }
+        }
+    }
+    if !opts.quiet {
+        eprintln!("{} record(s) from {manifest}", records.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Deletion times, which carving and the MFT alone cannot give.
 ///
 /// `$STANDARD_INFORMATION` has no deleted field, so this reads the two places

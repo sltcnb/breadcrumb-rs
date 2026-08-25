@@ -33,7 +33,7 @@ fn known_crashing_inputs_are_still_handled() {
         let src = Source::open(tmp.to_str().unwrap()).unwrap();
         let limit = src.size();
         let mut w = Window::new(&src, 0, limit);
-        if let Some(carve) = (sig.handler)(&mut w) {
+        if let Some(carve) = sig.carve(&mut w) {
             assert!(
                 carve.size <= limit,
                 "{}: {} carved {} bytes from a {} byte window",

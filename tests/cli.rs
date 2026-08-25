@@ -49,23 +49,85 @@ fn grep_finds_both_ascii_and_utf16_forms() {
     let src = Source::open(path.to_str().unwrap()).unwrap();
 
     let mut hits: Vec<(u64, &'static str)> = Vec::new();
-    let n = grep::search(&src, &[needle.to_string()], 0, 0, false, 0, |h| {
+    let q = grep::Query::literal(vec![needle.to_string()]);
+    let n = grep::search(&src, &q, 0, 0, |h| {
         hits.push((h.offset, h.encoding));
         assert!(
             h.context.contains(needle),
             "context lost the match: {}",
             h.context
         );
-    });
+    })
+    .unwrap();
     assert_eq!(n, 2);
     hits.sort();
     assert_eq!(hits, vec![(5000, "ascii"), (20_000, "utf-16le")]);
 
     // case-insensitive matching, and the hit cap
-    let n = grep::search(&src, &["secret-token-42".into()], 0, 0, true, 1, |_| {});
+    let q = grep::Query {
+        patterns: vec!["secret-token-42".into()],
+        ignore_case: true,
+        regex: false,
+        max_hits: 1,
+    };
+    let n = grep::search(&src, &q, 0, 0, |_| {}).unwrap();
     assert_eq!(n, 1, "--max-hits should stop the scan");
-    let n = grep::search(&src, &["secret-token-42".into()], 0, 0, false, 0, |_| {});
+    let n = grep::search(
+        &src,
+        &grep::Query::literal(vec!["secret-token-42".into()]),
+        0,
+        0,
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(n, 0, "case-sensitive search must not match");
+}
+
+#[test]
+fn regex_search_finds_what_a_keyword_cannot() {
+    // A pattern is for evidence with a shape rather than a known string: card
+    // numbers, IBANs, an internal ticket format.
+    let dir = Tmp::new("grep-regex");
+    let mut blob = vec![0x20u8; 40_000];
+    blob[1000..1019].copy_from_slice(b"4111 1111 1111 1111");
+    blob[9000..9016].copy_from_slice(b"CASE-2024-004711");
+    blob[20_000..20_017].copy_from_slice(b"not-a-case-number");
+    let path = write(&dir, "img.bin", &blob);
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+
+    let q = grep::Query {
+        patterns: vec![
+            r"[0-9]{4}([ -]?[0-9]{4}){3}".into(),
+            r"CASE-[0-9]{4}-[0-9]{6}".into(),
+        ],
+        ignore_case: false,
+        regex: true,
+        max_hits: 0,
+    };
+    let mut hits: Vec<(u64, String)> = Vec::new();
+    let n = grep::search(&src, &q, 0, 0, |h| {
+        hits.push((h.offset, h.pattern.clone()));
+    })
+    .unwrap();
+    assert_eq!(n, 2, "{hits:?}");
+    hits.sort();
+    assert_eq!(hits[0].0, 1000);
+    assert_eq!(hits[1].0, 9000);
+
+    // A pattern that will not compile is an error, not zero hits: silently
+    // finding nothing would look like an absence of evidence.
+    let bad = grep::Query {
+        patterns: vec!["([unclosed".into()],
+        ignore_case: false,
+        regex: true,
+        max_hits: 0,
+    };
+    let err = grep::search(&src, &bad, 0, 0, |_| {}).expect_err("bad regex accepted");
+    assert!(err.contains("--grep"), "{err}");
+
+    // The same pattern as a literal finds nothing, which is the point.
+    let literal = grep::Query::literal(vec![r"CASE-[0-9]{4}-[0-9]{6}".into()]);
+    assert_eq!(grep::search(&src, &literal, 0, 0, |_| {}).unwrap(), 0);
 }
 
 #[test]
@@ -192,4 +254,69 @@ fn dry_run_default_options_are_unchanged() {
     assert!(o.skip_carved && o.dedup && o.skip_blank);
     assert_eq!(o.align, 1);
     assert_eq!(o.jobs, 1);
+}
+
+#[test]
+fn reports_can_be_written_from_a_manifest_without_the_image() {
+    // A case often needs a report in a different shape months later, when the
+    // evidence is not attached any more. The manifest is the record.
+    let dir = Tmp::new("from-manifest");
+    let mut blob = vec![0u8; 2048];
+    let png = builders::make_png();
+    blob.extend_from_slice(&png);
+    blob.extend_from_slice(&vec![0u8; 2048]);
+    let img = write(&dir, "disk.dd", &blob);
+    let out = dir.0.join("out");
+
+    let exe = env!("CARGO_BIN_EXE_bcrumb-rs");
+    let scan = std::process::Command::new(exe)
+        .args([&img.to_string_lossy().to_string(), "-t", "png", "-o"])
+        .arg(&out)
+        .arg("-q")
+        .output()
+        .expect("scan failed to run");
+    assert!(
+        scan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    let manifest = out.join("manifest.json");
+    assert!(manifest.exists());
+
+    // The image is gone; the reports must still be writable.
+    std::fs::remove_file(&img).unwrap();
+    let csv = dir.0.join("late.csv");
+    let html = dir.0.join("late.html");
+    let report = std::process::Command::new(exe)
+        .arg("--from-manifest")
+        .arg(&manifest)
+        .arg("--csv")
+        .arg(&csv)
+        .arg("--html")
+        .arg(&html)
+        .arg("-q")
+        .output()
+        .expect("report failed to run");
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let csv_text = std::fs::read_to_string(&csv).unwrap();
+    assert_eq!(csv_text.lines().count(), 2, "{csv_text}");
+    assert!(csv_text.contains(",png,2048,"), "{csv_text}");
+    assert!(std::fs::read_to_string(&html).unwrap().contains("png"));
+
+    // Asking for no report at all is a mistake worth reporting.
+    let empty = std::process::Command::new(exe)
+        .arg("--from-manifest")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(!empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("--csv"),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
 }

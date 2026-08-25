@@ -28,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(src) = Source::open(path.to_str().unwrap()) {
         let limit = src.size();
         let mut w = Window::new(&src, 0, limit);
-        if let Some(carve) = (sig.handler)(&mut w) {
+        if let Some(carve) = sig.carve(&mut w) {
             assert!(
                 carve.size <= limit,
                 "{}: carve of {} bytes past a {} byte window",

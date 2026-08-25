@@ -28,6 +28,9 @@ aes = "0.8"
 # recorded; neither is used for anything security-bearing.
 md-5 = "0.10"
 sha1 = "0.10"
+# Byte-oriented regex for --grep --regex. Shares the aho-corasick above for its
+# literal prefilter, so it costs little beyond the pattern compiler.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 # Pure-Rust inflate (miniz_oxide), for the gzip handler. No C toolchain needed.
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 

@@ -188,6 +188,47 @@ of its own, so "not checked" stays distinguishable from "checked and failed".
 Validation also tightens a carve that over-read: a PNG followed by unrelated
 bytes comes back cut at IEND, and a SQLite database at its last page.
 
+## Searching, custom formats, later reports
+
+**Search** takes a keyword or a pattern:
+
+```sh
+bcrumb-rs disk.E01 --grep secret-project --max-hits 50      # ASCII + UTF-16LE
+bcrumb-rs disk.E01 --regex --grep "[0-9]{4}([ -]?[0-9]{4}){3}"
+```
+
+A literal is searched in both Latin-1 and UTF-16LE, because Windows artefacts
+store text either way. A regex is matched against the bytes as they are. A
+pattern that will not compile is an error, not zero hits — silently finding
+nothing looks like an absence of evidence.
+
+**A format the tool does not know** needs a magic and, ideally, an end marker:
+
+```json
+[
+  {"name": "widget", "ext": "wdg", "magic": "57494447",
+   "footer": "454e4457", "max_size": "1M"},
+  {"name": "blob", "magic": ["0xCAFEBABE", "DEADBEEF"], "max_size": 4096}
+]
+```
+
+```sh
+bcrumb-rs disk.dd --sig-file mysigs.json -o out          # alongside the built-ins
+bcrumb-rs disk.dd --sig-file mysigs.json --only-custom   # instead of them
+```
+
+With a footer the carve ends after the first match and counts as validated;
+without one it runs to `max_size` and is reported unvalidated, because nothing
+in the data says where the file ends. `"footer_optional": true` allows the
+fallback when the marker is missing.
+
+**Reports later, without the image**: the manifest is the record, so a case can
+be reported in a different shape long after the evidence is detached.
+
+```sh
+bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
+```
+
 ## Not ported
 
 This is the carving core only. For any of the following, use the Python
@@ -210,8 +251,6 @@ implementation — it remains the reference and the more complete tool:
   ```
 - **Bifragment reassembly** — the gap-carving search for a file split into
   two pieces with unrelated data between them
-- **Regex `--grep`** (literal patterns are supported here), custom `--sig-file`
-  signatures, and `--from-manifest`
 
 ## Image formats
 

@@ -113,7 +113,7 @@ fn handlers_survive_mutated_input() {
         for sig in SIGNATURES {
             let started = Instant::now();
             let mut w = Window::new(&src, 0, limit);
-            if let Some(carve) = (sig.handler)(&mut w) {
+            if let Some(carve) = sig.carve(&mut w) {
                 assert!(
                     carve.size <= limit,
                     "{} carved {} bytes from a {} byte window\ninput: {:02x?}",

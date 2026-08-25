@@ -313,7 +313,7 @@ impl<'a> Carver<'a> {
         }
         let carve: Carve = {
             let mut w = Window::new(self.reader, start, cap);
-            match (sig.handler)(&mut w) {
+            match sig.carve(&mut w) {
                 Some(c) => c,
                 None => {
                     self.rejected += 1;

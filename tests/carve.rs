@@ -625,7 +625,9 @@ fn best_effort_handlers_return_plausible_carves() {
         let reader = Source::open(path.to_str().unwrap()).unwrap();
         let mut w = window_over(&reader);
         let sig = SIGNATURES.iter().find(|s| s.name == name).unwrap();
-        let carve = (sig.handler)(&mut w).unwrap_or_else(|| panic!("{name} rejected"));
+        let carve = sig
+            .carve(&mut w)
+            .unwrap_or_else(|| panic!("{name} rejected"));
         assert!(carve.size >= data.len() as u64, "{name}: truncated");
         assert!(carve.size <= blob.len() as u64, "{name}: past the window");
     }

@@ -10,7 +10,12 @@ const KB: u64 = 1 << 10;
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
 
-pub type Handler = fn(&mut Window) -> Option<Carve>;
+/// How a signature carves: a built-in parser, or a footer rule from a
+/// `--sig-file` that only exists at run time.
+pub enum Handler {
+    Fn(fn(&mut Window) -> Option<Carve>),
+    Footer(crate::customsig::Spec),
+}
 pub type Precheck = fn(&[u8], usize) -> bool;
 
 pub struct Signature {
@@ -21,6 +26,35 @@ pub struct Signature {
     pub max_size: u64,
     pub precheck: Option<Precheck>,
     pub description: &'static str,
+}
+
+impl Signature {
+    /// Run this signature's parser over a window.
+    pub fn carve(&self, w: &mut Window) -> Option<Carve> {
+        match &self.handler {
+            Handler::Fn(f) => f(w),
+            Handler::Footer(spec) => {
+                let unbounded = Carve {
+                    size: w.limit,
+                    ext: spec.ext,
+                    validated: false,
+                };
+                if spec.footer.is_empty() {
+                    // Nothing marks the end: carve the capped window and say so.
+                    return Some(unbounded);
+                }
+                match w.find(&spec.footer, spec.header_offset + 1, None) {
+                    Some(at) => Some(Carve {
+                        size: at + spec.footer.len() as u64,
+                        ext: spec.ext,
+                        validated: true,
+                    }),
+                    None if spec.footer_optional => Some(unbounded),
+                    None => None,
+                }
+            }
+        }
+    }
 }
 
 fn pre_bmp(buf: &[u8], i: usize) -> bool {
@@ -73,7 +107,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "jpg",
         magics: &[b"\xff\xd8\xff"],
         header_offset: 0,
-        handler: handlers::carve_jpeg,
+        handler: Handler::Fn(handlers::carve_jpeg),
         max_size: 64 * MB,
         precheck: None,
         description: "JPEG image",
@@ -82,7 +116,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "png",
         magics: &[b"\x89PNG\r\n\x1a\n"],
         header_offset: 0,
-        handler: handlers::carve_png,
+        handler: Handler::Fn(handlers::carve_png),
         max_size: 64 * MB,
         precheck: None,
         description: "PNG image",
@@ -91,7 +125,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "gif",
         magics: &[b"GIF87a", b"GIF89a"],
         header_offset: 0,
-        handler: handlers::carve_gif,
+        handler: Handler::Fn(handlers::carve_gif),
         max_size: 32 * MB,
         precheck: None,
         description: "GIF image",
@@ -100,7 +134,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "bmp",
         magics: &[b"BM"],
         header_offset: 0,
-        handler: handlers::carve_bmp,
+        handler: Handler::Fn(handlers::carve_bmp),
         max_size: 64 * MB,
         precheck: Some(pre_bmp),
         description: "BMP image",
@@ -109,7 +143,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "tif",
         magics: &[b"II*\x00", b"MM\x00*"],
         header_offset: 0,
-        handler: handlers::carve_tiff,
+        handler: Handler::Fn(handlers::carve_tiff),
         max_size: 256 * MB,
         precheck: None,
         description: "TIFF image",
@@ -118,7 +152,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "pdf",
         magics: &[b"%PDF-"],
         header_offset: 0,
-        handler: handlers::carve_pdf,
+        handler: Handler::Fn(handlers::carve_pdf),
         max_size: 128 * MB,
         precheck: None,
         description: "PDF document",
@@ -127,7 +161,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "rtf",
         magics: &[b"{\\rtf"],
         header_offset: 0,
-        handler: handlers::carve_rtf,
+        handler: Handler::Fn(handlers::carve_rtf),
         max_size: 64 * MB,
         precheck: None,
         description: "Rich Text Format",
@@ -136,7 +170,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "ole",
         magics: &[b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"],
         header_offset: 0,
-        handler: handlers::carve_ole,
+        handler: Handler::Fn(handlers::carve_ole),
         max_size: 64 * MB,
         precheck: None,
         description: "OLE2/CFB: doc, xls, ppt, msg, vsd, msi",
@@ -145,7 +179,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "pst",
         magics: &[b"!BDN"],
         header_offset: 0,
-        handler: handlers::carve_pst,
+        handler: Handler::Fn(handlers::carve_pst),
         max_size: 64 * GB,
         precheck: None,
         description: "Outlook store (.pst/.ost)",
@@ -154,7 +188,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "zip",
         magics: &[b"PK\x03\x04"],
         header_offset: 0,
-        handler: handlers::carve_zip,
+        handler: Handler::Fn(handlers::carve_zip),
         max_size: 512 * MB,
         precheck: None,
         description: "ZIP, docx/xlsx/pptx, jar, apk, epub, odf",
@@ -163,7 +197,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "gz",
         magics: &[b"\x1f\x8b\x08"],
         header_offset: 0,
-        handler: handlers::carve_gzip,
+        handler: Handler::Fn(handlers::carve_gzip),
         max_size: 256 * MB,
         precheck: None,
         description: "gzip",
@@ -172,7 +206,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "7z",
         magics: &[b"7z\xbc\xaf\x27\x1c"],
         header_offset: 0,
-        handler: handlers::carve_7z,
+        handler: Handler::Fn(handlers::carve_7z),
         max_size: 4 * GB,
         precheck: None,
         description: "7-Zip",
@@ -181,7 +215,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "sqlite",
         magics: &[b"SQLite format 3\x00"],
         header_offset: 0,
-        handler: handlers::carve_sqlite,
+        handler: Handler::Fn(handlers::carve_sqlite),
         max_size: GB,
         precheck: None,
         description: "SQLite 3 database",
@@ -190,7 +224,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "mp4",
         magics: &[b"ftyp"],
         header_offset: 4,
-        handler: handlers::carve_mp4,
+        handler: Handler::Fn(handlers::carve_mp4),
         max_size: 4 * GB,
         precheck: Some(pre_ftyp),
         description: "MP4/MOV/HEIC/AVIF/3GP/M4A/M4V",
@@ -199,7 +233,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "riff",
         magics: &[b"RIFF"],
         header_offset: 0,
-        handler: handlers::carve_riff,
+        handler: Handler::Fn(handlers::carve_riff),
         max_size: 2 * GB,
         precheck: Some(pre_riff),
         description: "WAV, AVI, WebP",
@@ -208,7 +242,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "mp3",
         magics: &[b"ID3"],
         header_offset: 0,
-        handler: handlers::carve_mp3,
+        handler: Handler::Fn(handlers::carve_mp3),
         max_size: 256 * MB,
         precheck: Some(pre_id3),
         description: "MP3 (ID3v2-tagged)",
@@ -217,7 +251,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "rar",
         magics: &[b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00"],
         header_offset: 0,
-        handler: handlers::carve_rar,
+        handler: Handler::Fn(handlers::carve_rar),
         max_size: 16 * MB,
         precheck: None,
         description: "RAR4/5 (capped carve, unvalidated)",
@@ -226,7 +260,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "exe",
         magics: &[b"MZ"],
         header_offset: 0,
-        handler: handlers::carve_pe,
+        handler: Handler::Fn(handlers::carve_pe),
         max_size: 256 * MB,
         precheck: Some(pre_mz),
         description: "PE (exe/dll)",
@@ -241,7 +275,7 @@ pub static SIGNATURES: &[Signature] = &[
             b"\xca\xfe\xba\xbe",
         ],
         header_offset: 0,
-        handler: handlers::carve_macho,
+        handler: Handler::Fn(handlers::carve_macho),
         max_size: 256 * MB,
         precheck: None,
         description: "Mach-O thin + universal",
@@ -250,7 +284,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "flac",
         magics: &[b"fLaC"],
         header_offset: 0,
-        handler: handlers::carve_flac,
+        handler: Handler::Fn(handlers::carve_flac),
         max_size: 512 * MB,
         precheck: None,
         description: "FLAC audio",
@@ -259,7 +293,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "psd",
         magics: &[b"8BPS"],
         header_offset: 0,
-        handler: handlers::carve_psd,
+        handler: Handler::Fn(handlers::carve_psd),
         max_size: 512 * MB,
         precheck: None,
         description: "Photoshop document",
@@ -268,7 +302,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "elf",
         magics: &[b"\x7fELF"],
         header_offset: 0,
-        handler: handlers::carve_elf,
+        handler: Handler::Fn(handlers::carve_elf),
         max_size: 256 * MB,
         precheck: None,
         description: "ELF binary",
@@ -277,7 +311,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "ico",
         magics: &[b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"],
         header_offset: 0,
-        handler: handlers::carve_ico,
+        handler: Handler::Fn(handlers::carve_ico),
         max_size: 8 * MB,
         precheck: None,
         description: "ICO / CUR",
@@ -286,7 +320,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "ogg",
         magics: &[b"OggS"],
         header_offset: 0,
-        handler: handlers::carve_ogg,
+        handler: Handler::Fn(handlers::carve_ogg),
         max_size: 512 * MB,
         precheck: None,
         description: "OGG (Vorbis/Opus/Theora)",
@@ -295,7 +329,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "mkv",
         magics: &[b"\x1a\x45\xdf\xa3"],
         header_offset: 0,
-        handler: handlers::carve_mkv,
+        handler: Handler::Fn(handlers::carve_mkv),
         max_size: 4 * GB,
         precheck: None,
         description: "Matroska / WebM",
@@ -304,7 +338,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "evtx",
         magics: &[b"ElfFile\x00"],
         header_offset: 0,
-        handler: handlers::carve_evtx,
+        handler: Handler::Fn(handlers::carve_evtx),
         max_size: 256 * MB,
         precheck: None,
         description: "Windows event log",
@@ -313,7 +347,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "hive",
         magics: &[b"regf"],
         header_offset: 0,
-        handler: handlers::carve_regf,
+        handler: Handler::Fn(handlers::carve_regf),
         max_size: 256 * MB,
         precheck: None,
         description: "Windows registry hive",
@@ -322,7 +356,7 @@ pub static SIGNATURES: &[Signature] = &[
         name: "plist",
         magics: &[b"bplist00"],
         header_offset: 0,
-        handler: handlers::carve_bplist,
+        handler: Handler::Fn(handlers::carve_bplist),
         max_size: 64 * KB * 1024,
         precheck: None,
         description: "Apple binary plist",
