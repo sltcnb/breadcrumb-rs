@@ -96,11 +96,13 @@ fn handlers_survive_mutated_input() {
     let deadline = Instant::now() + Duration::from_secs(50);
     let mut cases = 0u32;
 
-    while cases < 4000 && Instant::now() < deadline {
+    while cases < 20000 && Instant::now() < deadline {
         let seed = &seeds[(rng.next_u64() as usize) % seeds.len()];
         let mut body = mutate(&mut rng, seed);
         // occasionally mutate twice: single-field damage is the easy case
-        if rng.next_u64() % 3 == 0 {
+        // Up to four mutations: single-field damage is the easy case, and
+        // overflow bugs tend to need several fields wrong at once.
+        for _ in 0..(rng.next_u64() % 4) {
             body = mutate(&mut rng, &body);
         }
         std::fs::write(&path, &body).unwrap();

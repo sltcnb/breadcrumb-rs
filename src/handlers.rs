@@ -149,7 +149,7 @@ pub fn carve_png(w: &mut Window) -> Option<Carve> {
         if length > 0x7FFF_FFFF || !type_ok {
             return None;
         }
-        pos += 12 + length;
+        pos = pos.saturating_add(12).saturating_add(length);
         if pos > w.limit {
             return None; // a chunk length that runs off the end: truncated
         }
@@ -167,7 +167,7 @@ pub fn carve_gif(w: &mut Window) -> Option<Carve> {
     let mut pos: u64 = 13;
     let packed = head[10];
     if packed & 0x80 != 0 {
-        pos += 3 * (2u64 << (packed & 0x07));
+        pos = pos.saturating_add(3u64.saturating_mul(2u64 << (packed & 0x07)));
     }
 
     fn skip_subblocks(w: &mut Window, mut p: u64) -> Option<u64> {
@@ -200,7 +200,7 @@ pub fn carve_gif(w: &mut Window) -> Option<Carve> {
             let desc = w.exact(pos, 9)?;
             pos += 9;
             if desc[8] & 0x80 != 0 {
-                pos += 3 * (2u64 << (desc[8] & 0x07));
+                pos = pos.saturating_add(3u64.saturating_mul(2u64 << (desc[8] & 0x07)));
             }
             pos += 1; // LZW minimum code size
             pos = skip_subblocks(w, pos)?;
@@ -265,7 +265,11 @@ pub fn carve_tiff(w: &mut Window) -> Option<Carve> {
             return None;
         }
         let table = w.exact(ifd + 2, (n * 12 + 4) as usize)?;
-        end = end.max(ifd + 2 + n * 12 + 4);
+        end = end.max(
+            ifd.saturating_add(2)
+                .saturating_add(n.saturating_mul(12))
+                .saturating_add(4),
+        );
         let mut offsets: Vec<u64> = Vec::new();
         let mut counts: Vec<u64> = Vec::new();
         for i in 0..n as usize {
@@ -277,9 +281,9 @@ pub fn carve_tiff(w: &mut Window) -> Option<Carve> {
                 Some(s) => s,
                 None => continue,
             };
-            let total = tsz * cnt;
+            let total = tsz.saturating_mul(cnt);
             if total > 4 {
-                end = end.max(g32(e, 8) + total);
+                end = end.max(g32(e, 8).saturating_add(total));
             }
             if tag == 273 || tag == 324 || tag == 279 || tag == 325 {
                 // SHORT/LONG values, inline when they fit in the 4-byte field
@@ -311,7 +315,7 @@ pub fn carve_tiff(w: &mut Window) -> Option<Carve> {
             }
         }
         for (o, c) in offsets.iter().zip(counts.iter()) {
-            end = end.max(o + c);
+            end = end.max(o.saturating_add(*c));
         }
         ifd = g32(&table, (n * 12) as usize);
     }
@@ -535,7 +539,8 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
     if max_used < 0 {
         return fallback(w);
     }
-    let end = (max_used as u64 + 2) * sector; // the header occupies "sector -1"
+    // the header occupies "sector -1"
+    let end = (max_used as u64).saturating_add(2).saturating_mul(sector);
     if end > w.limit {
         return fallback(w);
     }
@@ -847,7 +852,7 @@ pub fn carve_sqlite(w: &mut Window) -> Option<Carve> {
     if page_count == 0 {
         return carve(w.limit, "sqlite", false); // legacy: header count unset
     }
-    let size = page_size * page_count;
+    let size = page_size.saturating_mul(page_count);
     if size > w.limit {
         return None;
     }
@@ -926,7 +931,7 @@ pub fn carve_mp4(w: &mut Window) -> Option<Carve> {
         } else if size == 0 {
             size = w.limit - pos; // box extends to end of file
         }
-        if size < 8 || pos + size > w.limit {
+        if size < 8 || pos.saturating_add(size) > w.limit {
             return None;
         }
         pos += size;
@@ -949,7 +954,7 @@ pub fn carve_riff(w: &mut Window) -> Option<Carve> {
         b"WEBP" => "webp",
         _ => return None,
     };
-    let size = u32le(&h, 4) + 8;
+    let size = u32le(&h, 4).saturating_add(8);
     if size > w.limit {
         return None;
     }
@@ -1076,13 +1081,16 @@ pub fn carve_pe(w: &mut Window) -> Option<Carve> {
     if magic != 0x10B && magic != 0x20B {
         return None;
     }
-    let mut end = e_lfanew + 24 + opt_size + nsections * 40;
+    let mut end = e_lfanew
+        .saturating_add(24)
+        .saturating_add(opt_size)
+        .saturating_add(nsections.saturating_mul(40));
     let sects = w.exact(e_lfanew + 24 + opt_size, (nsections * 40) as usize)?;
     for i in 0..nsections as usize {
         let raw_size = u32le(&sects, i * 40 + 16);
         let raw_ptr = u32le(&sects, i * 40 + 20);
         if raw_ptr != 0 {
-            end = end.max(raw_ptr + raw_size);
+            end = end.max(raw_ptr.saturating_add(raw_size));
         }
     }
     // The Authenticode certificate table sits beyond the sections, and its
@@ -1092,7 +1100,7 @@ pub fn carve_pe(w: &mut Window) -> Option<Carve> {
         let cert_off = u32le(&opt, (dd_off + 32) as usize);
         let cert_size = u32le(&opt, (dd_off + 36) as usize);
         if cert_off != 0 && cert_size != 0 {
-            end = end.max(cert_off + cert_size);
+            end = end.max(cert_off.saturating_add(cert_size));
         }
     }
     if end > w.limit {
@@ -1145,21 +1153,23 @@ fn macho_thin_size(w: &mut Window, base: u64) -> Option<u64> {
         match cmd {
             0x19 if cmdsize >= 56 => {
                 // LC_SEGMENT_64: fileoff + filesize
-                end = end.max(g64(&cmds, pos + 40) + g64(&cmds, pos + 48));
+                end = end.max(g64(&cmds, pos + 40).saturating_add(g64(&cmds, pos + 48)));
             }
             0x01 if cmdsize >= 40 => {
                 // LC_SEGMENT
-                end = end.max(g32(&cmds, pos + 32) + g32(&cmds, pos + 36));
+                end = end.max(g32(&cmds, pos + 32).saturating_add(g32(&cmds, pos + 36)));
             }
             0x02 if cmdsize >= 24 => {
                 // LC_SYMTAB: symbol table and string table
                 let nlist = if bits == 64 { 16 } else { 12 };
-                end = end.max(g32(&cmds, pos + 8) + g32(&cmds, pos + 12) * nlist);
-                end = end.max(g32(&cmds, pos + 16) + g32(&cmds, pos + 20));
+                end = end.max(
+                    g32(&cmds, pos + 8).saturating_add(g32(&cmds, pos + 12).saturating_mul(nlist)),
+                );
+                end = end.max(g32(&cmds, pos + 16).saturating_add(g32(&cmds, pos + 20)));
             }
             0x1D | 0x1E | 0x26 | 0x29 | 0x2B | 0x2E | 0x2F if cmdsize >= 16 => {
                 // linkedit_data commands: dataoff + datasize
-                end = end.max(g32(&cmds, pos + 8) + g32(&cmds, pos + 12));
+                end = end.max(g32(&cmds, pos + 8).saturating_add(g32(&cmds, pos + 12)));
             }
             _ => {}
         }
@@ -1186,11 +1196,11 @@ pub fn carve_macho(w: &mut Window) -> Option<Carve> {
         for i in 0..nfat as usize {
             let a_off = u32be(&table, i * 20 + 8);
             let a_size = u32be(&table, i * 20 + 12);
-            if a_off + a_size > w.limit {
+            if a_off.saturating_add(a_size) > w.limit {
                 return None;
             }
             macho_thin_size(w, a_off)?; // every slice must itself be Mach-O
-            end = end.max(a_off + a_size);
+            end = end.max(a_off.saturating_add(a_size));
         }
         return carve(end, "macho", true);
     }
@@ -1292,9 +1302,13 @@ pub fn carve_elf(w: &mut Window) -> Option<Carve> {
     }
     let mut end: u64 = 0;
     if e_shoff != 0 && e_shnum != 0 {
-        end = e_shoff + e_shnum * e_shentsize;
+        end = e_shoff.saturating_add(e_shnum.saturating_mul(e_shentsize));
     } else if e_phoff != 0 && e_phnum != 0 {
-        let ph = w.exact(e_phoff, (e_phnum * e_phentsize) as usize)?;
+        let want = e_phnum.saturating_mul(e_phentsize);
+        if want > w.limit {
+            return None; // a program header table larger than the window
+        }
+        let ph = w.exact(e_phoff, want as usize)?;
         for i in 0..e_phnum as usize {
             let base = i * e_phentsize as usize;
             let (p_offset, p_filesz) = if ei_class == 1 {
@@ -1302,7 +1316,7 @@ pub fn carve_elf(w: &mut Window) -> Option<Carve> {
             } else {
                 (g64(&ph, base + 8), g64(&ph, base + 32))
             };
-            end = end.max(p_offset + p_filesz);
+            end = end.max(p_offset.saturating_add(p_filesz));
         }
     }
     if end <= 52 || end > w.limit {
@@ -1320,7 +1334,7 @@ pub fn carve_ico(w: &mut Window) -> Option<Carve> {
     if !matches!(rtype, 1 | 2) || !(1..=512).contains(&count) {
         return None;
     }
-    let mut end = 6 + count * 16;
+    let mut end = 6u64.saturating_add(count.saturating_mul(16));
     let entries = w.exact(6, (count * 16) as usize)?;
     for i in 0..count as usize {
         let size = u32le(&entries, i * 16 + 8);
@@ -1328,7 +1342,7 @@ pub fn carve_ico(w: &mut Window) -> Option<Carve> {
         if off < end || size == 0 {
             return None;
         }
-        end = end.max(off + size);
+        end = end.max(off.saturating_add(size));
     }
     if end > w.limit {
         return None;
@@ -1357,7 +1371,10 @@ pub fn carve_ogg(w: &mut Window) -> Option<Carve> {
         }
         let body: u64 = table.iter().map(|&b| b as u64).sum();
         let header = w.read(pos + 5, 1).first().copied().unwrap_or(0);
-        pos += 27 + nseg as u64 + body;
+        pos = pos
+            .saturating_add(27)
+            .saturating_add(nseg as u64)
+            .saturating_add(body);
         if pos > w.limit {
             break; // page body runs past EOF/limit
         }
@@ -1468,7 +1485,7 @@ pub fn carve_evtx(w: &mut Window) -> Option<Carve> {
         return None;
     }
     // 4096-byte file header + 65536 bytes per chunk
-    let end = 4096 + num_chunks * 65536;
+    let end = 4096u64.saturating_add(num_chunks.saturating_mul(65536));
     if end > w.limit {
         return None;
     }
@@ -1486,7 +1503,7 @@ pub fn carve_regf(w: &mut Window) -> Option<Carve> {
     if hbins_size == 0 || hbins_size > w.limit {
         return None;
     }
-    let end = 4096 + hbins_size; // 4 KiB base block + hbins
+    let end = 4096u64.saturating_add(hbins_size); // 4 KiB base block + hbins
     if end > w.limit {
         return None;
     }
