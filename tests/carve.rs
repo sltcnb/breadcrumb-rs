@@ -638,6 +638,30 @@ fn best_effort_handlers_return_plausible_carves() {
 }
 
 #[test]
+fn an_unresolvable_zip_carve_is_bounded() {
+    // A stray PK\x03\x04 in unrelated data declares whatever the next bytes
+    // say. On a real image that walked hundreds of megabytes and shipped a
+    // 400 MB "docx" that was not a zip at all.
+    let dir = Tmp::new("zipbound");
+    let mut blob: Vec<u8> = b"PK\x03\x04".to_vec();
+    blob.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // ver..date
+    blob.extend_from_slice(&0u32.to_le_bytes()); // crc
+    blob.extend_from_slice(&(900u32 << 20).to_le_bytes()); // compressed size: absurd
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&4u16.to_le_bytes()); // name length
+    blob.extend_from_slice(&0u16.to_le_bytes());
+    blob.extend_from_slice(b"junk");
+    blob.extend_from_slice(&builders::Rng::new(77).bytes(40 << 20));
+    let path = write_tmp(&dir, "stray.bin", &blob);
+
+    let records = carve_all(&path, dir.join("out"), |o| o.dry_run = true);
+    for r in records.iter().filter(|r| r.offset == 0) {
+        assert!(r.size <= 16 << 20, "unresolved zip carved {} bytes", r.size);
+        assert!(!r.validated);
+    }
+}
+
+#[test]
 fn office_group_resolves_to_every_document_container() {
     let names: Vec<&str> = resolve_types("office")
         .unwrap()

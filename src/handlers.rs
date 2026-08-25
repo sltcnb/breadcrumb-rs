@@ -579,6 +579,11 @@ const ZIP_HINTS: &[(&[u8], &str)] = &[
 /// members can be accounted for exactly -- no searching. A zip written to a
 /// non-seekable stream defers its sizes to a data descriptor and cannot be
 /// walked, so the caller falls back to the EOCD.
+/// Largest member size to trust from a local header alone.
+const ZIP_MEMBER_SANITY: u64 = 64 << 20;
+/// Cap on a carve that never resolved a central directory.
+const ZIP_UNRESOLVED_CAP: u64 = 16 << 20;
+
 fn zip_walk_members(w: &mut Window) -> (u64, bool) {
     let mut pos: u64 = 0;
     loop {
@@ -595,6 +600,14 @@ fn zip_walk_members(w: &mut Window) -> (u64, bool) {
         }
         if csize == 0xFFFF_FFFF {
             return (pos, false); // zip64: real size is in the extra field
+        }
+        // A member size only means something if the header is really a header.
+        // In carved data a stray PK\x03\x04 declares whatever the next bytes
+        // say, and following that walked hundreds of megabytes of unrelated
+        // disk on a real image. A genuine archive that large still resolves
+        // through its central directory, which is checked by the caller.
+        if csize > ZIP_MEMBER_SANITY {
+            return (pos, false);
         }
         let nxt = pos + 30 + name_len + extra_len + csize;
         if nxt <= pos || nxt > w.limit {
@@ -674,9 +687,11 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
         search = eocd + 1;
     }
 
-    // Nothing conclusive: carve only the bytes actually accounted for, flagged
-    // unvalidated. The data is at the front; the tail is elsewhere on disk.
-    let accounted = accounted.min(w.limit);
+    // Nothing conclusive: carve the bytes accounted for, bounded and flagged
+    // unvalidated. The useful data is at the front; without a central directory
+    // there is nothing to say where the archive ends, so an unbounded walk just
+    // ships unrelated disk.
+    let accounted = accounted.min(w.limit).min(ZIP_UNRESOLVED_CAP);
     if accounted == 0 {
         return None;
     }
