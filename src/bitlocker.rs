@@ -613,6 +613,10 @@ impl Volume {
 /// identifier GUID at 0xA0; Vista used 0x160. Both are returned -- a zero entry
 /// is not a candidate, so whichever layout this volume uses, only its offsets
 /// survive.
+pub fn metadata_offsets_pub(boot: &[u8]) -> Vec<u64> {
+    metadata_offsets(boot)
+}
+
 fn metadata_offsets(boot: &[u8]) -> Vec<u64> {
     let mut out = Vec::new();
     for base in [0xB0usize, 0x160] {
@@ -640,6 +644,89 @@ pub fn volume_identifier(boot: &[u8]) -> Option<String> {
     } else {
         Some(id)
     }
+}
+
+/// Describe the FVE metadata structure, for diagnosing a volume that will not
+/// unlock. Key material is never printed: for each wrapped key that opens, only
+/// the payload length and its leading header bytes, which is what says how the
+/// key sits inside it.
+pub fn describe_metadata(meta: &FveMetadata, creds: &Credentials) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!(
+        "encryption method {:#06x} ({}), header sectors {}, volume header offset {:#x}",
+        meta.encryption_method,
+        method_name(meta.encryption_method),
+        meta.header_sectors,
+        meta.volume_header_offset
+    ));
+    for e in &meta.entries {
+        out.push(format!(
+            "entry etype={:#06x} vtype={:#06x} len={}",
+            e.etype,
+            e.vtype,
+            e.data.len()
+        ));
+        if e.vtype == VT_VMK && e.data.len() >= 0x1C {
+            out.push(format!(
+                "  protector {} type {:#06x} ({})",
+                guid(&e.data[..16]),
+                u16le(&e.data, 0x1A),
+                protector_name(u16le(&e.data, 0x1A))
+            ));
+            for n in walk_entries(&e.data[0x1C..]) {
+                out.push(format!(
+                    "  nested etype={:#06x} vtype={:#06x} len={}",
+                    n.etype,
+                    n.vtype,
+                    n.data.len()
+                ));
+                if n.vtype == VT_STRETCH_KEY && n.data.len() >= 20 {
+                    for inner in walk_entries(&n.data[20..]) {
+                        out.push(format!(
+                            "    in stretch: etype={:#06x} vtype={:#06x} len={}",
+                            inner.etype,
+                            inner.vtype,
+                            inner.data.len()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // What the credential actually opens, and how the payload is shaped.
+    let mut vmks: Vec<Vec<u8>> = Vec::new();
+    for e in &meta.entries {
+        if e.vtype == VT_VMK {
+            if let Some(mut k) = unlock_vmk(e, creds) {
+                for cand in &k {
+                    out.push(format!("vmk candidate: {} bytes", cand.len()));
+                }
+                vmks.append(&mut k);
+            }
+        }
+    }
+    for e in &meta.entries {
+        if e.vtype != VT_AES_CCM_KEY {
+            continue;
+        }
+        for (i, vmk) in vmks.iter().enumerate() {
+            if let Some(payload) = ccm_blob_decrypt(vmk, &e.data) {
+                let head: String = payload
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push(format!(
+                    "wrapped key etype={:#06x} opened by vmk[{i}]: payload {} bytes, \
+                     header {head} (key bytes not shown)",
+                    e.etype,
+                    payload.len()
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub fn is_bitlocker(src: &Source, base: u64) -> bool {

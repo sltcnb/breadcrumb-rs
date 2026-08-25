@@ -53,6 +53,8 @@ options:
       --machine           JSON-lines events on stdout (for wrapping)
       --hexdump OFF[:LEN] print LEN bytes at OFF (decoded, after any unlock)
                           and exit; for inspecting a structure by hand
+      --dump-fve          describe the BitLocker metadata (entry types, sizes,
+                          protectors, payload shapes) and exit; no key material
   -q, --quiet             no progress output
   -V, --version           print version and exit
   -h, --help              this help
@@ -101,6 +103,7 @@ fn run() -> Result<ExitCode, String> {
     let mut creds = breadcrumb_rs::bitlocker::Credentials::default();
     let mut scan_metadata = false;
     let mut hexdump: Option<(u64, usize)> = None;
+    let mut dump_fve = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -174,6 +177,7 @@ fn run() -> Result<ExitCode, String> {
             }
             "--bitlocker-password" => creds.password = Some(next(&mut i)?),
             "--bitlocker-scan-metadata" => scan_metadata = true,
+            "--dump-fve" => dump_fve = true,
             "--hexdump" => {
                 let v = next(&mut i)?;
                 let (off, len) = match v.split_once(':') {
@@ -238,6 +242,57 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
+
+    if dump_fve {
+        use breadcrumb_rs::bitlocker as bl;
+        let mut bases = vec![0u64];
+        for p in breadcrumb_rs::partition::parse(&reader) {
+            if p.start > 0 {
+                bases.push(p.start);
+            }
+        }
+        let mut found = false;
+        for base in bases {
+            if !bl::is_bitlocker(&reader, base) {
+                continue;
+            }
+            found = true;
+            println!("BitLocker volume at {base:#x}");
+            let boot = reader.pread(base, 512);
+            if let Some(id) = bl::volume_identifier(&boot) {
+                println!("  volume identifier {id}");
+            }
+            let mut meta = None;
+            for off in bl::metadata_offsets_pub(&boot) {
+                let block = reader.pread(base + off, 0x10000);
+                if block.len() >= 8 && block.starts_with(bl::FVE_SIGNATURE) {
+                    if let Ok(m) = bl::parse_metadata(&block) {
+                        println!("  metadata at {off:#x} (volume-relative)");
+                        meta = Some(m);
+                        break;
+                    }
+                }
+            }
+            if meta.is_none() && scan_metadata {
+                meta = bl::scan_for_metadata(&reader, base, reader.size() - base, |m| {
+                    println!("  {m}")
+                });
+            }
+            match meta {
+                Some(m) => {
+                    for line in bl::describe_metadata(&m, &creds) {
+                        println!("  {line}");
+                    }
+                }
+                None => println!("  no metadata block found"),
+            }
+        }
+        if !found {
+            println!("no BitLocker volume found");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let quiet = opts.quiet;
     let reader = reader.unlock_bitlocker(&creds, scan_metadata, |msg| {
         if !quiet {
