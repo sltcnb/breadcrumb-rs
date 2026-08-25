@@ -41,6 +41,13 @@ options:
       --ntfs              NTFS undelete: walk the MFT for deleted files,
                           recovering names, paths and timestamps
       --include-live      with --ntfs, also recover files still in use
+      --deleted-times     when files were deleted, from $Recycle.Bin/$I records
+                          and the $UsnJrnl change journal (writes deletions.csv)
+      --usn-all           with --deleted-times, report every journal reason,
+                          not only deletions
+      --events FILE       write the deletion events to this CSV instead
+                          (the source may also be a folder of already-extracted
+                          $I / $UsnJrnl files rather than an image)
       --list-partitions   print the partition table and detected filesystems
       --csv FILE          write a CSV of the carve results
       --bodyfile FILE     write a Sleuth Kit bodyfile
@@ -80,6 +87,10 @@ by scenario
     bcrumb-rs disk.E01 -t office -o out --bitlocker-recovery-key 650441-...-609257
   filenames, paths and timestamps instead of bytes (NTFS)
     bcrumb-rs disk.E01 --ntfs -o out --csv files.csv
+  when files were deleted (recycle bin + change journal)
+    bcrumb-rs disk.E01 --deleted-times -o out
+  ...from artefacts already pulled off a machine
+    bcrumb-rs ./artefacts --deleted-times --events deletions.csv
   what is on the disk before committing to a long scan
     bcrumb-rs disk.E01 --list-partitions
   inventory first: how much would a full carve write?
@@ -257,6 +268,9 @@ fn run() -> Result<ExitCode, String> {
     let mut resume = false;
     let mut ntfs_mode = false;
     let mut include_live = false;
+    let mut deleted_times = false;
+    let mut usn_all = false;
+    let mut events_path: Option<String> = None;
     let mut i = 0;
 
     while i < argv.len() {
@@ -319,6 +333,9 @@ fn run() -> Result<ExitCode, String> {
             }
             "--ntfs" => ntfs_mode = true,
             "--include-live" => include_live = true,
+            "--deleted-times" => deleted_times = true,
+            "--usn-all" => usn_all = true,
+            "--events" => events_path = Some(next(&mut i)?),
             "--list-partitions" | "--list-parts" => list_partitions = true,
             "--csv" => csv_path = Some(next(&mut i)?),
             "--bodyfile" => bodyfile_path = Some(next(&mut i)?),
@@ -398,6 +415,11 @@ fn run() -> Result<ExitCode, String> {
     };
     if sigs.is_empty() {
         return Err("no signatures selected".into());
+    }
+
+    if deleted_times && std::path::Path::new(&source).is_dir() {
+        let events = breadcrumb_rs::artifacts::scan_tree(&source, !usn_all);
+        return report_deletions(events, &opts, events_path.as_deref(), machine, &[]);
     }
 
     let reader = Source::open(&source).map_err(|e| format!("{source}: {e}"))?;
@@ -490,6 +512,10 @@ fn run() -> Result<ExitCode, String> {
 
     if verify {
         return verify_image(&reader, opts.quiet);
+    }
+
+    if deleted_times {
+        return run_deleted_times(&reader, &opts, usn_all, events_path.as_deref(), machine);
     }
 
     if ntfs_mode {
@@ -729,6 +755,113 @@ fn run() -> Result<ExitCode, String> {
 /// deleted file, its name, directory path and four timestamps come back with
 /// it, and a fragmented file is reassembled from its runlist instead of being
 /// carved as its first fragment plus junk.
+/// Deletion times, which carving and the MFT alone cannot give.
+///
+/// `$STANDARD_INFORMATION` has no deleted field, so this reads the two places
+/// Windows does record one: a `$I` file per Explorer-deleted item, and the
+/// `FILE_DELETE` records in the change journal.
+fn run_deleted_times(
+    reader: &Source,
+    opts: &Options,
+    usn_all: bool,
+    events_path: Option<&str>,
+    machine: bool,
+) -> Result<ExitCode, String> {
+    let base = ntfs_base(reader, opts)?;
+    // 256 MiB per artefact: a journal is normally far smaller, and the cap
+    // keeps a corrupt one from being read as gigabytes.
+    let found = breadcrumb_rs::ntfs::deletion_events(reader, base, !usn_all, 256 << 20)?;
+    report_deletions(found.events, opts, events_path, machine, &found.sources)
+}
+
+fn report_deletions(
+    mut events: Vec<breadcrumb_rs::artifacts::DeletionEvent>,
+    opts: &Options,
+    events_path: Option<&str>,
+    machine: bool,
+    sources: &[(String, usize)],
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::artifacts;
+
+    if !opts.quiet {
+        for (path, count) in sources {
+            eprintln!("artefact: {path} ({count} event(s))");
+        }
+    }
+    if events.is_empty() {
+        if !opts.quiet {
+            eprintln!(
+                "no deletion artefacts found; the recycle bin may be empty and \
+                 the change journal disabled or wiped"
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    events.sort_by(|a, b| a.when.cmp(&b.when).then_with(|| a.name.cmp(&b.name)));
+    if machine {
+        for e in &events {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("deletion")),
+                    ("when", json::number(e.when)),
+                    ("source", json::string(e.source)),
+                    ("name", json::string(&e.name)),
+                    ("size", json::number(e.size)),
+                    ("detail", json::string(&e.detail)),
+                ])
+            );
+        }
+    } else if !opts.quiet {
+        for e in events.iter().take(20) {
+            eprintln!("  {} {} {}", e.when, e.source, e.name);
+        }
+        if events.len() > 20 {
+            eprintln!("  ... {} more", events.len() - 20);
+        }
+    }
+    let csv = match events_path {
+        Some(p) => Some(p.to_string()),
+        None if !opts.dry_run => Some(
+            std::path::Path::new(&opts.out_dir)
+                .join("deletions.csv")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        None => None,
+    };
+    if let Some(path) = csv {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let n = artifacts::write_events_csv(&events, &path).map_err(|e| format!("{path}: {e}"))?;
+        if !opts.quiet {
+            eprintln!("wrote {n} deletion event(s) to {path}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The NTFS volume to work on: the whole image, a partition of it, or the
+/// offset the analyst gave.
+fn ntfs_base(reader: &Source, opts: &Options) -> Result<u64, String> {
+    if opts.start != 0 || breadcrumb_rs::partition::detect_fs(reader, 0) == "ntfs" {
+        return Ok(opts.start);
+    }
+    let parts = breadcrumb_rs::partition::parse(reader);
+    match parts.iter().find(|p| p.fstype == "ntfs") {
+        Some(p) => {
+            if !opts.quiet {
+                eprintln!("ntfs: volume at {:#x} ({})", p.start, p.name);
+            }
+            Ok(p.start)
+        }
+        None => Err("no NTFS volume found; pass --offset to point at one \
+                     (--list-partitions shows what is here)"
+            .into()),
+    }
+}
+
 fn run_ntfs(
     reader: &Source,
     opts: &Options,
@@ -739,23 +872,7 @@ fn run_ntfs(
     use breadcrumb_rs::ntfs;
 
     // The volume may be the whole image, or a partition of it.
-    let mut base = opts.start;
-    if base == 0 && breadcrumb_rs::partition::detect_fs(reader, 0) != "ntfs" {
-        let parts = breadcrumb_rs::partition::parse(reader);
-        match parts.iter().find(|p| p.fstype == "ntfs") {
-            Some(p) => {
-                if !opts.quiet {
-                    eprintln!("ntfs: volume at {:#x} ({})", p.start, p.name);
-                }
-                base = p.start;
-            }
-            None => {
-                return Err("no NTFS volume found; pass --offset to point at one \
-                            (--list-partitions shows what is here)"
-                    .into())
-            }
-        }
-    }
+    let base = ntfs_base(reader, opts)?;
 
     let nopts = ntfs::Options {
         out_dir: opts.out_dir.clone(),

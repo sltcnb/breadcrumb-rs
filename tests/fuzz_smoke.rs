@@ -189,3 +189,54 @@ fn fve_metadata_parsing_survives_mutated_blocks() {
         }
     }
 }
+
+#[test]
+fn deletion_artefact_parsing_survives_mutated_records() {
+    // Both records declare their own lengths on disk: a $I record its path
+    // length, a USN record its size and its name bounds.
+    let mut rng = Rng::new(0xDE1E7E);
+    let mut recycle = 2u64.to_le_bytes().to_vec();
+    recycle.extend_from_slice(&44_213u64.to_le_bytes());
+    recycle.extend_from_slice(&133_400_000_000_000_000u64.to_le_bytes());
+    recycle.extend_from_slice(&12u32.to_le_bytes());
+    recycle.extend_from_slice(
+        &"C:\\a\\b.txt\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>(),
+    );
+
+    let mut journal = vec![0u8; 64];
+    journal.extend_from_slice(&96u32.to_le_bytes());
+    journal.extend_from_slice(&2u16.to_le_bytes());
+    journal.extend_from_slice(&0u16.to_le_bytes());
+    journal.resize(64 + 24, 0);
+    journal.extend_from_slice(&1u64.to_le_bytes()); // usn
+    journal.extend_from_slice(&133_400_000_000_000_000u64.to_le_bytes());
+    journal.extend_from_slice(&0x200u32.to_le_bytes()); // file-delete
+    journal.resize(64 + 24 + 32, 0);
+    journal.extend_from_slice(&20u16.to_le_bytes()); // name length
+    journal.extend_from_slice(&60u16.to_le_bytes()); // name offset
+    journal.resize(64 + 96, 0x41);
+
+    for _ in 0..2000 {
+        let started = Instant::now();
+        let r = mutate(&mut rng, &recycle);
+        if let Some(entry) = breadcrumb_rs::artifacts::parse_recycle_i(&r) {
+            // A path is only ever read from inside the record.
+            assert!(entry.path.len() <= r.len() * 2);
+        }
+        let j = mutate(&mut rng, &journal);
+        let mut recs = Vec::new();
+        let consumed = breadcrumb_rs::artifacts::parse_usn_journal(&j, &mut recs);
+        assert!(consumed <= j.len(), "consumed past the end of the stream");
+        for rec in &recs {
+            let _ = breadcrumb_rs::artifacts::describe_reasons(rec.reason);
+            assert!(rec.name.len() <= j.len() * 2);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "journal walk hung"
+        );
+    }
+}

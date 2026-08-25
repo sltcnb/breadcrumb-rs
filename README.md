@@ -133,6 +133,32 @@ skipped rather than written out as garbage, and a file whose clusters have been
 reused since deletion comes back with whatever is there now, flagged low
 confidence — never silently.
 
+## When files were deleted
+
+NTFS records four timestamps per file and none of them is "deleted": the MFT
+change time is only a proxy. Two Windows artefacts record it outright, and
+`--deleted-times` reads both:
+
+```sh
+bcrumb-rs disk.E01 --deleted-times -o out          # writes out/deletions.csv
+bcrumb-rs ./artefacts --deleted-times --events d.csv   # already-extracted files
+```
+
+- `$Recycle.Bin/$I*` — one record per item deleted through Explorer: the
+  deletion time, the original size, and the full original path (both the
+  Vista-era fixed-length layout and the Windows 10 length-prefixed one)
+- `$Extend/$UsnJrnl:$J` — the change journal, read straight off the volume,
+  live or deleted, V2 and V3 records; `--usn-all` reports every reason rather
+  than only `file-delete`
+
+The journal is sparse, so only its allocated clusters are read — its declared
+length is mostly hole. A carved copy that starts inside a record still parses:
+the walk hunts for the next plausible record instead of trusting the offset it
+started on.
+
+An empty result is reported as one, not as an absence of evidence: the recycle
+bin may simply be empty, and the journal can be disabled or wiped.
+
 ## Not ported
 
 This is the carving core only. For any of the following, use the Python

@@ -10,6 +10,7 @@
 //! written out as garbage, and a file whose clusters have been reused comes back
 //! with whatever is there now — flagged low confidence, never silently.
 
+use crate::artifacts;
 use crate::reader::Source;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -171,6 +172,37 @@ impl<'a> Volume<'a> {
     }
 
     /// Concatenate runs into `length` bytes; sparse runs read as zeros.
+    /// Allocated bytes of a stream, up to `cap`, with sparse holes skipped
+    /// rather than materialised as zeros.
+    ///
+    /// The change journal is a sparse file whose hole is most of its declared
+    /// length, so reading it the ordinary way would mean gigabytes of nothing.
+    fn read_allocated(&self, runs: &[Run], cap: usize) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for &(lcn, count) in runs {
+            if out.len() >= cap {
+                break;
+            }
+            let Some(lcn) = lcn else { continue };
+            let bytes = count.saturating_mul(self.cluster);
+            if lcn.saturating_add(count).saturating_mul(self.cluster) > self.volume_size {
+                continue; // run points outside the volume: not this file's any more
+            }
+            let want = (bytes as usize).min(cap - out.len());
+            let at = self.base.saturating_add(lcn.saturating_mul(self.cluster));
+            let mut done = 0usize;
+            while done < want {
+                let chunk = self.src.pread(at + done as u64, (want - done).min(8 << 20));
+                if chunk.is_empty() {
+                    break;
+                }
+                done += chunk.len();
+                out.extend_from_slice(&chunk);
+            }
+        }
+        out
+    }
+
     fn read_runs(&self, runs: &[Run], length: u64) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(length.min(1 << 24) as usize);
         for &(lcn, count) in runs {
@@ -606,5 +638,122 @@ fn recover_stream(
         deleted: !info.in_use,
         path: out_path,
         timestamps: info.timestamps,
+    })
+}
+
+/// A file read out of the MFT and handed to another parser instead of being
+/// written to disk.
+pub struct Extracted {
+    /// Full virtual path, with `~stream` appended for a named stream.
+    pub path: String,
+    pub name: String,
+    pub mft: u64,
+    pub deleted: bool,
+    pub data: Vec<u8>,
+}
+
+/// Read the files whose path and stream name `want` accepts, live or deleted.
+///
+/// This is how the deletion artefacts are collected: `$Recycle.Bin/$I*` and
+/// `$Extend/$UsnJrnl:$J` are ordinary files, so the MFT walk already knows
+/// where they are. `cap` bounds each stream.
+pub fn extract(
+    src: &Source,
+    base: u64,
+    want: impl Fn(&str, &str) -> bool,
+    cap: usize,
+) -> Result<Vec<Extracted>, String> {
+    let vol = Volume::open(src, base)?;
+    let mut infos: HashMap<u64, Info> = HashMap::new();
+    for num in 0..vol.record_count {
+        if let Some(info) = parse_record(&vol, num) {
+            if info.base_record == 0 {
+                infos.insert(num, info);
+            }
+        }
+    }
+    let paths = build_paths(&infos);
+    let mut nums: Vec<u64> = infos.keys().copied().collect();
+    nums.sort_unstable();
+    let mut out = Vec::new();
+    for num in nums {
+        let info = &infos[&num];
+        if info.is_dir || info.name.is_empty() {
+            continue;
+        }
+        let vpath = paths.get(&num).cloned().unwrap_or_default();
+        for stream in &info.data {
+            if !want(&vpath.to_lowercase(), &stream.name) {
+                continue;
+            }
+            let data = if stream.resident {
+                stream.content.clone()
+            } else {
+                match stream.runs.as_deref() {
+                    // Compressed or encrypted: the raw clusters are not the file.
+                    Some(runs) if stream.flags & 0x4001 == 0 => vol.read_allocated(runs, cap),
+                    _ => continue,
+                }
+            };
+            if data.is_empty() {
+                continue;
+            }
+            let label = if stream.name.is_empty() {
+                vpath.clone()
+            } else {
+                format!("{vpath}~{}", stream.name)
+            };
+            out.push(Extracted {
+                path: label,
+                name: info.name.clone(),
+                mft: num,
+                deleted: !info.in_use,
+                data,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// What a volume's deletion artefacts yielded: the events, and how many came
+/// from each artefact so a report can name its sources.
+pub struct Deletions {
+    pub events: Vec<artifacts::DeletionEvent>,
+    pub sources: Vec<(String, usize)>,
+}
+
+/// Collect deletion events from a volume's `$Recycle.Bin` and change journal.
+pub fn deletion_events(
+    src: &Source,
+    base: u64,
+    deletions_only: bool,
+    cap: usize,
+) -> Result<Deletions, String> {
+    let found = extract(
+        src,
+        base,
+        |path, stream| {
+            let file = path.rsplit('/').next().unwrap_or(path);
+            // $I records live in the recycle bin; the journal is the $J stream
+            // of $Extend/$UsnJrnl.
+            (file.starts_with("$i") && file.len() > 2 && path.contains("recycle"))
+                || (file.contains("usnjrnl") && (stream == "$J" || stream.is_empty()))
+        },
+        cap,
+    )?;
+    let mut events = Vec::new();
+    let mut tally = Vec::new();
+    for item in found {
+        let before = events.len();
+        if item.name.to_lowercase().contains("usnjrnl") {
+            events.extend(artifacts::events_from_usn(&item.data, deletions_only));
+        } else {
+            events.extend(artifacts::events_from_recycle(&item.data, &item.name));
+        }
+        tally.push((item.path, events.len() - before));
+    }
+    Ok(Deletions {
+        events,
+        sources: tally,
     })
 }
