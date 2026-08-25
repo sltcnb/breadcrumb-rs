@@ -217,7 +217,30 @@ pub fn parse_metadata(block: &[u8]) -> Result<FveMetadata, String> {
     })
 }
 
-/// A decrypted CCM "key" payload is a 4-byte header then the raw key bytes.
+/// Candidate key bytes inside a decrypted CCM payload.
+///
+/// The payload carries a header before the key material, and its length is not
+/// something a synthetic fixture can settle: Windows writes a metadata-entry
+/// header (size, entry type, value type, version) ahead of the key, others use
+/// four bytes. Guessing wrong yields a key of the right length but shifted --
+/// and because the CCM MAC covers the ciphertext, not our reading of it, the
+/// mistake only surfaces one step later. Return every plausible reading and let
+/// the next stage, which can check its result, choose.
+fn key_candidates(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for skip in [8usize, 4, 12, 0] {
+        if payload.len() > skip {
+            let cand = payload[skip..].to_vec();
+            if !out.contains(&cand) {
+                out.push(cand);
+            }
+        }
+    }
+    out
+}
+
+/// The first plausible reading, for the .BEK path where there is nothing to
+/// check the result against.
 fn key_from_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() > 4 {
         payload[4..].to_vec()
@@ -299,7 +322,7 @@ fn vmk_key_material(nested: &[Entry]) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
 }
 
 /// Turn one VMK metadata entry into the plaintext VMK, if a credential fits.
-fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
+fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<Vec<u8>>> {
     let data = &entry.data;
     if data.len() < 0x1C {
         return None;
@@ -310,7 +333,7 @@ fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
     // Clear key (suspended BitLocker): the VMK sits in the open.
     if protection == PROT_CLEAR {
         if let Some(k) = nested.iter().find(|e| e.vtype == VT_KEY) {
-            return Some(key_from_payload(&k.data));
+            return Some(key_candidates(&k.data));
         }
     }
 
@@ -332,7 +355,7 @@ fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
                 let dk = stretch_key(&initial, salt);
                 for blob in &blobs {
                     if let Some(payload) = ccm_blob_decrypt(&dk, blob) {
-                        return Some(key_from_payload(&payload));
+                        return Some(key_candidates(&payload));
                     }
                 }
             }
@@ -346,7 +369,7 @@ fn unlock_vmk(entry: &Entry, creds: &Credentials) -> Option<Vec<u8>> {
             if let Some(ext) = external_key_from_bek(bek) {
                 for blob in &blobs {
                     if let Some(payload) = ccm_blob_decrypt(&ext, blob) {
-                        return Some(key_from_payload(&payload));
+                        return Some(key_candidates(&payload));
                     }
                 }
             }
@@ -387,33 +410,56 @@ impl FveMetadata {
     }
 }
 
-pub fn recover_fvek(meta: &FveMetadata, creds: &Credentials) -> Result<Vec<u8>, String> {
+pub fn recover_fvek_candidates(
+    meta: &FveMetadata,
+    creds: &Credentials,
+) -> Result<Vec<Vec<u8>>, String> {
     if let Some(fvek) = &creds.fvek {
-        return Ok(fvek.clone());
+        return Ok(vec![fvek.clone()]);
     }
-    let mut vmk = None;
+    let mut vmks: Vec<Vec<u8>> = Vec::new();
     for e in &meta.entries {
         if e.vtype == VT_VMK {
-            if let Some(k) = unlock_vmk(e, creds) {
-                vmk = Some(k);
-                break;
+            if let Some(mut k) = unlock_vmk(e, creds) {
+                vmks.append(&mut k);
             }
         }
     }
-    let vmk = vmk.ok_or_else(|| {
-        "no VMK could be unlocked with the supplied credential (wrong recovery \
-         key / password, or unsupported protector)"
-            .to_string()
-    })?;
-    let fvek_entry = meta
+    if vmks.is_empty() {
+        return Err("no VMK could be unlocked with the supplied credential \
+                    (wrong recovery key / password, or unsupported protector)"
+            .to_string());
+    }
+    // Prefer the entry that declares itself the FVEK, then any other wrapped key.
+    let mut wrapped: Vec<&Entry> = meta
         .entries
         .iter()
-        .find(|e| e.etype == ET_FVEK && e.vtype == VT_AES_CCM_KEY)
-        .or_else(|| meta.entries.iter().find(|e| e.vtype == VT_AES_CCM_KEY))
-        .ok_or("no FVEK entry in metadata")?;
-    let payload = ccm_blob_decrypt(&vmk, &fvek_entry.data)
-        .ok_or("FVEK entry did not decrypt under the recovered VMK")?;
-    Ok(key_from_payload(&payload))
+        .filter(|e| e.etype == ET_FVEK && e.vtype == VT_AES_CCM_KEY)
+        .collect();
+    wrapped.extend(
+        meta.entries
+            .iter()
+            .filter(|e| e.vtype == VT_AES_CCM_KEY && e.etype != ET_FVEK),
+    );
+    if wrapped.is_empty() {
+        return Err("no FVEK entry in metadata".into());
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for entry in wrapped {
+        for vmk in &vmks {
+            if let Some(payload) = ccm_blob_decrypt(vmk, &entry.data) {
+                for cand in key_candidates(&payload) {
+                    if !out.contains(&cand) {
+                        out.push(cand);
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err("FVEK entry did not decrypt under the recovered VMK".into());
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------ volume cipher
@@ -713,20 +759,64 @@ pub fn unlock_volume(
             }
         )
     })?;
-    let fvek = recover_fvek(&meta, creds)?;
-    let cipher = Cipher::new(meta.encryption_method, &fvek)?;
+    let candidates = recover_fvek_candidates(&meta, creds)?;
     let size = if meta.encrypted_volume_size > 0 {
         meta.encrypted_volume_size
     } else {
         src.size() - base
     };
-    Ok(Some(Volume {
-        base,
-        size,
-        sector_size,
-        method: meta.encryption_method,
-        cipher,
-        header_bytes: meta.header_sectors as u64 * sector_size,
-        header_src: meta.volume_header_offset,
-    }))
+    let mut last_err = String::new();
+    let mut fallback: Option<Volume> = None;
+    for fvek in &candidates {
+        let cipher = match Cipher::new(meta.encryption_method, fvek) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        let volume = Volume {
+            base,
+            size,
+            sector_size,
+            method: meta.encryption_method,
+            cipher,
+            header_bytes: meta.header_sectors as u64 * sector_size,
+            header_src: meta.volume_header_offset,
+        };
+        // The only test that proves a key: decrypt the volume's first sector
+        // and see whether a filesystem boot sector comes out.
+        if looks_like_volume_header(&volume.read(src, 0, sector_size as usize)) {
+            return Ok(Some(volume));
+        }
+        if fallback.is_none() {
+            fallback = Some(volume);
+        }
+    }
+    if let Some(volume) = fallback {
+        log(
+            "bitlocker: warning: the key recovered does not decrypt the volume \
+             header into a recognisable boot sector; the result may be wrong",
+        );
+        return Ok(Some(volume));
+    }
+    Err(if last_err.is_empty() {
+        "recovered no usable FVEK".to_string()
+    } else {
+        last_err
+    })
+}
+
+/// Does this look like the plaintext first sector of a volume?
+fn looks_like_volume_header(sector: &[u8]) -> bool {
+    if sector.len() < 512 {
+        return false;
+    }
+    if &sector[510..512] == b"\x55\xaa" {
+        return true;
+    }
+    matches!(
+        &sector[3..11],
+        b"NTFS    " | b"EXFAT   " | b"MSDOS5.0" | b"MSWIN4.1" | b"FAT32   "
+    )
 }

@@ -162,7 +162,7 @@ fn a_raw_fvek_skips_key_recovery_and_gives_the_same_bytes() {
         }
     }
     let meta = meta.expect("no FVE metadata");
-    let fvek = bitlocker::recover_fvek(
+    let fvek = bitlocker::recover_fvek_candidates(
         &meta,
         &Credentials {
             recovery: Some(RECOVERY.into()),
@@ -171,15 +171,43 @@ fn a_raw_fvek_skips_key_recovery_and_gives_the_same_bytes() {
     )
     .expect("fvek recovery failed");
 
-    let with_fvek = carve_unlocked(
-        &image,
-        &Credentials {
-            fvek: Some(fvek),
+    // The payload header length is not fixed, so recovery yields several
+    // readings of the key. One of them is the real FVEK: passing that one back
+    // as a raw key must reproduce the same carve.
+    // A candidate of the wrong length is rejected outright by the cipher, which
+    // is a legitimate answer: only the reading that is really the key counts.
+    let matched = fvek.into_iter().enumerate().any(|(i, cand)| {
+        let creds = Credentials {
+            fvek: Some(cand),
             ..Default::default()
-        },
-        "fvek",
+        };
+        let src = Source::open(image.to_str().unwrap()).unwrap();
+        match src.unlock_bitlocker(&creds, false, |_| {}) {
+            Ok(unlocked) => {
+                let out = out_dir(&format!("fvek{i}"));
+                let opts = Options {
+                    out_dir: out.to_string_lossy().into(),
+                    quiet: true,
+                    dry_run: true,
+                    ..Options::default()
+                };
+                let mut c = Carver::new(&unlocked, SIGNATURES.iter().collect(), &opts);
+                let mut recs: Vec<(u64, u64, String)> = c
+                    .run()
+                    .into_iter()
+                    .map(|r| (r.offset, r.size, r.sha256))
+                    .collect();
+                recs.sort();
+                let _ = std::fs::remove_dir_all(&out);
+                recs == with_password
+            }
+            Err(_) => false,
+        }
+    });
+    assert!(
+        matched,
+        "no FVEK candidate reproduced the password-unlocked carve"
     );
-    assert_eq!(with_password, with_fvek);
 }
 
 #[test]
