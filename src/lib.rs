@@ -20,5 +20,6 @@ pub mod partition;
 pub mod reader;
 pub mod report;
 pub mod signatures;
+pub mod validate;
 pub mod verify;
 pub mod window;

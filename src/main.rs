@@ -38,6 +38,11 @@ options:
                           (repeatable; both ASCII and UTF-16LE are matched)
   -i, --ignore-case       case-insensitive --grep
       --max-hits N        stop after N --grep hits
+      --validate          decode each carved file to confirm it is intact, not
+                          only well formed (PNG/ZIP+OOXML/gzip CRCs, JPEG and
+                          SQLite structure); reported as verified/failed
+      --drop-failed       with --validate, do not keep a file that failed to
+                          decode
       --ntfs              NTFS undelete: walk the MFT for deleted files,
                           recovering names, paths and timestamps
       --include-live      with --ntfs, also recover files still in use
@@ -99,6 +104,8 @@ by scenario
     bcrumb-rs disk.E01 -j 0 -o /mnt/scratch/out
   find a keyword, in ASCII and UTF-16LE
     bcrumb-rs disk.E01 --grep secret-project --max-hits 50
+  only files that actually decode (fragmented carves fail here)
+    bcrumb-rs disk.dd -t office,jpg -o out --validate --drop-failed
   a case file: CSV, timeline, HTML report and a custody hash
     bcrumb-rs disk.dd -o out --csv files.csv --timeline t.csv --html r.html --hash-source
   read from a pipe (spooled to a temp file, since handlers seek)
@@ -173,6 +180,11 @@ fn merge_with_existing(out_dir: &str, mut records: Vec<Record>) -> Vec<Record> {
             validated: get("validated") == Some("true"),
             path: get("path").unwrap_or("").to_string(),
             duplicate_of: None,
+            decoded: match get("decoded") {
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                _ => None,
+            },
         });
         recovered += 1;
     }
@@ -330,6 +342,11 @@ fn run() -> Result<ExitCode, String> {
             "--max-hits" => {
                 let v = next(&mut i)?;
                 max_hits = v.parse().map_err(|_| format!("not a number: {v:?}"))?;
+            }
+            "--validate" => opts.validate = true,
+            "--drop-failed" => {
+                opts.validate = true;
+                opts.drop_failed = true;
             }
             "--ntfs" => ntfs_mode = true,
             "--include-live" => include_live = true,
@@ -665,6 +682,13 @@ fn run() -> Result<ExitCode, String> {
                     ("size", json::number(r.size)),
                     ("sha256", json::string(&r.sha256)),
                     ("validated", json::boolean(r.validated)),
+                    (
+                        "decoded",
+                        match r.decoded {
+                            Some(v) => json::boolean(v),
+                            None => "null".to_string(),
+                        },
+                    ),
                     ("path", json::string(&r.path)),
                 ])
             );
@@ -1077,6 +1101,13 @@ fn write_manifest(
             ("size", json::number(r.size)),
             ("sha256", json::string(&r.sha256)),
             ("validated", json::boolean(r.validated)),
+            (
+                "decoded",
+                match r.decoded {
+                    Some(v) => json::boolean(v),
+                    None => "null".to_string(),
+                },
+            ),
             ("confidence", json::string(r.confidence())),
             (
                 "duplicate_of",

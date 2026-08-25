@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Record {
     pub kind: &'static str,
     pub ext: &'static str,
@@ -26,14 +26,21 @@ pub struct Record {
     pub validated: bool,
     pub path: String,
     pub duplicate_of: Option<u64>,
+    /// What deep validation concluded, when it ran: `Some(true)` decoded,
+    /// `Some(false)` failed to decode, `None` not attempted or inconclusive.
+    pub decoded: Option<bool>,
 }
 
 impl Record {
     pub fn confidence(&self) -> &'static str {
-        if self.validated {
-            "high"
-        } else {
-            "low"
+        match self.decoded {
+            // A decode is stronger evidence than a structure walk, in both
+            // directions: it can confirm a file the walk was unsure of, and
+            // condemn one the walk accepted.
+            Some(true) => "verified",
+            Some(false) => "failed",
+            None if self.validated => "high",
+            None => "low",
         }
     }
 }
@@ -106,6 +113,10 @@ pub struct Options {
     pub max_output: u64,
     /// Stop when the output filesystem has less than this much free (0 = off).
     pub min_free: u64,
+    /// Decode carved bytes to confirm the file is intact, not just well formed.
+    pub validate: bool,
+    /// Do not keep a carve whose decode failed.
+    pub drop_failed: bool,
 }
 
 impl Default for Options {
@@ -127,6 +138,8 @@ impl Default for Options {
             jobs: 1,
             max_output: 0,
             min_free: 0,
+            validate: false,
+            drop_failed: false,
         }
     }
 }
@@ -321,6 +334,53 @@ impl<'a> Carver<'a> {
             return None;
         }
 
+        // Deep validation needs the whole file at once, so a carve small
+        // enough to hold in memory is read, decoded and only then written --
+        // that way a tightened length is what lands on disk, and a failed
+        // decode need never be written at all.
+        let mut decoded: Option<bool> = None;
+        let mut buffered: Option<Vec<u8>> = None;
+        let mut carve_size = carve.size;
+        let mut validated = carve.validated;
+        if o.validate
+            && carve.size <= crate::validate::MAX_VALIDATE
+            && crate::validate::can_validate(carve.ext)
+        {
+            let mut data = Vec::with_capacity(carve.size as usize);
+            let mut got = 0u64;
+            while got < carve.size {
+                let want = ((carve.size - got) as usize).min(8 << 20);
+                let blk = self.reader.pread(start + got, want);
+                if blk.is_empty() {
+                    break;
+                }
+                got += blk.len() as u64;
+                data.extend_from_slice(&blk);
+            }
+            match crate::validate::validate(carve.ext, &data) {
+                crate::validate::Verdict::Verified(tighter) => {
+                    decoded = Some(true);
+                    validated = true;
+                    if let Some(n) = tighter {
+                        if n > 0 && n <= data.len() as u64 {
+                            data.truncate(n as usize);
+                            carve_size = n;
+                        }
+                    }
+                }
+                crate::validate::Verdict::Invalid => {
+                    decoded = Some(false);
+                    validated = false;
+                    if o.drop_failed {
+                        self.rejected += 1;
+                        return None;
+                    }
+                }
+                crate::validate::Verdict::Inconclusive => {}
+            }
+            buffered = Some(data);
+        }
+
         // Hash while streaming; write as we go unless this is a dry run.
         let mut hasher = Sha256::new();
         let mut path = String::new();
@@ -339,8 +399,17 @@ impl<'a> Carver<'a> {
             }
         };
         let mut done: u64 = 0;
-        while done < carve.size {
-            let want = ((carve.size - done) as usize).min(8 << 20);
+        if let Some(data) = buffered {
+            hasher.update(&data);
+            if let Some(f) = file.as_mut() {
+                if f.write_all(&data).is_err() {
+                    return None;
+                }
+            }
+            done = data.len() as u64;
+        }
+        while done < carve_size {
+            let want = ((carve_size - done) as usize).min(8 << 20);
             let blk = self.reader.pread(start + done, want);
             if blk.is_empty() {
                 break;
@@ -370,9 +439,10 @@ impl<'a> Carver<'a> {
             offset: start,
             size: done,
             sha256: format!("{:x}", hasher.finalize()),
-            validated: carve.validated,
+            validated,
             path,
             duplicate_of: None,
+            decoded,
         })
     }
 }

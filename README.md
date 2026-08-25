@@ -159,6 +159,35 @@ started on.
 An empty result is reported as one, not as an absence of evidence: the recycle
 bin may simply be empty, and the journal can be disabled or wiped.
 
+## Is the carved file intact?
+
+A handler agrees the structure is well formed. That is not the same as the file
+being whole: a fragmented file carved as consecutive bytes can keep its header
+and its trailer and still hold somebody else's data in the middle. Only a decode
+catches it.
+
+```sh
+bcrumb-rs disk.dd -t office,jpg -o out --validate       # report it
+bcrumb-rs disk.dd -t office,jpg -o out --drop-failed    # and keep only what decodes
+```
+
+`--validate` decodes each carved file of a type it can check and reports
+`verified` or `failed` in the CSV, the manifest and the HTML report — a column
+of its own, so "not checked" stays distinguishable from "checked and failed".
+`--drop-failed` implies `--validate` and does not write the failures at all.
+
+| type | what is actually checked |
+| --- | --- |
+| PNG | CRC of every chunk, IDAT inflated, tightened to the end of IEND |
+| ZIP, docx, xlsx, pptx, jar, apk, epub, odf | every member decompressed and CRC-checked against the central directory |
+| gzip | full inflate; the format's own length and CRC are verified by the decoder |
+| SQLite | header geometry against the length of the carve |
+| JPEG | marker walk and terminator — JPEG carries no checksum, so a pass here is not proof the image renders |
+| GIF, BMP | trailer and declared size |
+
+Validation also tightens a carve that over-read: a PNG followed by unrelated
+bytes comes back cut at IEND, and a SQLite database at its last page.
+
 ## Not ported
 
 This is the carving core only. For any of the following, use the Python
@@ -179,7 +208,8 @@ implementation — it remains the reference and the more complete tool:
   Use the Python implementation (https://github.com/sltcnb/BreadCrumb), which
   reads it directly, or convert to raw first.
   ```
-- **Deep validation** (`--validate`) and bifragment reassembly
+- **Bifragment reassembly** — the gap-carving search for a file split into
+  two pieces with unrelated data between them
 - **Regex `--grep`** (literal patterns are supported here), custom `--sig-file`
   signatures, and `--from-manifest`
 

@@ -15,13 +15,14 @@ fn csv_cell(s: &str) -> String {
 }
 
 pub fn csv(records: &[Record]) -> String {
-    let mut out =
-        String::from("type,ext,offset,size,sha256,validated,confidence,duplicate_of,path\n");
+    let mut out = String::from(
+        "type,ext,offset,size,sha256,validated,confidence,duplicate_of,path,decoded\n",
+    );
     for r in records {
         let dup = r.duplicate_of.map(|d| d.to_string()).unwrap_or_default();
         let _ = writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             csv_cell(r.kind),
             csv_cell(r.ext),
             r.offset,
@@ -32,7 +33,14 @@ pub fn csv(records: &[Record]) -> String {
             if r.validated { "True" } else { "False" },
             r.confidence(),
             dup,
-            csv_cell(&r.path)
+            csv_cell(&r.path),
+            // empty when no decode was attempted, so a reader can tell "not
+            // validated" from "validation failed"
+            match r.decoded {
+                Some(true) => "True",
+                Some(false) => "False",
+                None => "",
+            }
         );
     }
     out
@@ -108,7 +116,7 @@ pub fn html(source: &str, source_size: u64, records: &[Record], elapsed: f64) ->
          th,td{border-bottom:1px solid #ddd;padding:.35rem .6rem;text-align:left}\
          th{background:#f6f6f6}td.n{text-align:right;font-variant-numeric:tabular-nums}\
          code{background:#f2f2f2;padding:.1rem .3rem}\
-         .low{color:#a60}.high{color:#060}\n",
+         .low{color:#a60}.high{color:#060}.failed{color:#a00;font-weight:bold}\n",
     );
     out.push_str("</style>\n");
     let _ = writeln!(
@@ -137,7 +145,12 @@ pub fn html(source: &str, source_size: u64, records: &[Record], elapsed: f64) ->
     let mut rows: Vec<&Record> = records.iter().collect();
     rows.sort_by_key(|r| r.offset);
     for r in rows {
-        let cls = if r.validated { "high" } else { "low" };
+        let cls = match r.decoded {
+            Some(true) => "high",
+            Some(false) => "failed",
+            None if r.validated => "high",
+            None => "low",
+        };
         let _ = writeln!(
             out,
             "<tr><td class=n>{:#x}<td>{}<td class=n>{}<td class={}>{}\

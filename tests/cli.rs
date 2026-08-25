@@ -116,6 +116,7 @@ fn sample_records() -> Vec<Record> {
             validated: true,
             path: "out/png/f_000000001a00.png".into(),
             duplicate_of: None,
+            decoded: None,
         },
         Record {
             kind: "zip",
@@ -126,6 +127,7 @@ fn sample_records() -> Vec<Record> {
             validated: false,
             path: String::new(),
             duplicate_of: Some(0x1a00),
+            decoded: Some(false),
         },
     ]
 }
@@ -138,11 +140,18 @@ fn derived_reports_carry_every_record() {
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(
         lines[0],
-        "type,ext,offset,size,sha256,validated,confidence,duplicate_of,path"
+        "type,ext,offset,size,sha256,validated,confidence,duplicate_of,path,decoded"
     );
     assert_eq!(lines.len(), 3);
-    assert!(lines[1].contains(",True,high,,"), "{}", lines[1]);
-    assert!(lines[2].contains(",False,low,6656,"), "{}", lines[2]);
+    // The decoded column is empty when no decode ran, so a reader can tell
+    // "not validated" from "validation failed".
+    assert!(
+        lines[1].ends_with(",True,high,,out/png/f_000000001a00.png,"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[2].contains(",False,failed,6656,"), "{}", lines[2]);
+    assert!(lines[2].ends_with(",False"), "{}", lines[2]);
 
     // bodyfile: md5-slot|name|inode|mode|uid|gid|size|atime|mtime|ctime|crtime
     let body = report::bodyfile(&recs);
