@@ -17,6 +17,25 @@ cargo build --release
 ./target/release/bcrumb-rs disk.E01 -o carved -j 0   # EWF sets read natively
 ```
 
+## Which mode
+
+| What you have | What to run | What you get back |
+| --- | --- | --- |
+| a disk and no idea what is on it | [`--auto`](#a-whole-disk-in-one-pass) | every partition, each with the right undelete mode |
+| a Windows volume | [`--ntfs`](#ntfs-undelete) | original names, paths, four timestamps, fragmented files intact |
+| a card or USB stick | [`--fat`](#fat-and-exfat-undelete) | names, sizes, timestamps; contiguous files exactly |
+| a Linux volume | [`--ext4`](#ext234-undelete) | names, paths, and *when the file was deleted* |
+| a Mac volume | [`--apfs`](#apfs-recovery) / [`--hfs`](#hfs-undelete) | files from superseded objects / from the catalog |
+| a question of *when* | [`--deleted-times`](#when-files-were-deleted) | deletion times from the recycle bin and change journal |
+| no filesystem left at all | the default carve | files by their bytes, `-t` to pick types |
+| carved files you do not trust | [`--validate`](#is-the-carved-file-intact) | each one decoded, `verified` or `failed` |
+| a keyword or a pattern | [`--grep`](#searching-custom-formats-later-reports) | hits with offsets and context, ASCII and UTF-16LE |
+| an image to check first | [`--verify`](#verifying-the-image-first) | its hashes against the ones acquisition recorded |
+
+Nothing is guessed at: where a filesystem cannot say something — whether a FAT
+file was fragmented, whether an ext4 inode still has its map — the tool says so
+instead of implying it knows.
+
 ## Why Rust
 
 A carve is bounded almost entirely by one thing: finding candidate headers.
