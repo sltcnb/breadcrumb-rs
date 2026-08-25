@@ -199,9 +199,14 @@ pub fn parse_metadata(block: &[u8]) -> Result<FveMetadata, String> {
     if block.len() < 0x70 || &block[..8] != FVE_SIGNATURE {
         return Err("FVE metadata signature missing".into());
     }
+    // Metadata block header: encrypted_volume_size(8) at 0x10, volume header
+    // sector count at 0x1C, the three metadata offsets at 0x20/0x28/0x30, and
+    // the relocated volume header at 0x38. Reading 0x20 as the volume header
+    // offset gets the block's own address, which decrypts the metadata region
+    // as if it were the boot sector.
     let encrypted_volume_size = u64le(block, 0x10);
     let header_sectors = u32le(block, 0x1C);
-    let volume_header_offset = u64le(block, 0x20);
+    let volume_header_offset = u64le(block, 0x38);
     let metadata_size = u32le(block, 0x40) as usize;
     let encryption_method = u32le(block, 0x40 + 0x24) & 0xFFFF;
     let end = (0x40 + metadata_size).min(block.len());
