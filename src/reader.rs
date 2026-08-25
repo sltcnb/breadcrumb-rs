@@ -257,6 +257,15 @@ impl Source {
         }))
     }
 
+    /// Hashes the acquisition recorded in the image, if the format keeps any.
+    pub fn stored_hashes(&self) -> crate::ewf::StoredHashes {
+        match self {
+            Source::Ewf(e) => e.stored_hashes.clone(),
+            Source::BitLocker(b) => b.inner.stored_hashes(),
+            _ => Default::default(),
+        }
+    }
+
     /// What was opened, as a parenthesised phrase for the scan banner.
     ///
     /// Built by composing the parts rather than unwrapping an inner

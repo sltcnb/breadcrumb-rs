@@ -201,6 +201,27 @@ ciphertext and reporting "0 files" is indistinguishable from an empty disk.
 TPM-only protectors cannot be unlocked from an image by any tool: the key is
 sealed in hardware. Use the recovery key, a `.BEK`, or the FVEK.
 
+## Verifying the image first
+
+EWF stores the MD5, and usually the SHA-1, computed while the disk was read.
+`--verify` recomputes them over the decoded data and compares:
+
+```
+$ bcrumb-rs disk.E01 --verify
+md5    5bd967b8f1e50e694f72d358579c3323  MATCH  (stored 5bd967b8f1e50e694f72d358579c3323)
+sha1   671f433e9eb9a13aba58c13881ab5bc88f9aa00c  MATCH  (stored 671f...)
+sha256 4044e4245130a7304af475e0c4c62945534ef461f57263006da0639ba6fcaa3f
+2405376 bytes verified
+```
+
+Exit status is 0 only on a match, so it drops straight into a script. A missing
+segment or truncated acquisition fails with the offset where the read stopped,
+rather than being discovered halfway through a carve.
+
+One caveat worth knowing: if the source was not a whole number of sectors, some
+acquisition tools hash bytes they then do not store, which shows up here as a
+mismatch. Real disks are always sector multiples.
+
 ## Not filling the disk
 
 A carve can write more than the volume it is written to can hold: on a 238 GB

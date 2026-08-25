@@ -24,6 +24,10 @@ sha2 = "0.10"
 # AES-128/256 block cipher only; XTS, CBC, CCM and the Elephant diffuser are
 # built on top here, so the BitLocker path stays auditable in one file.
 aes = "0.8"
+# MD5 and SHA-1 only to check an image against the hashes the acquisition
+# recorded; neither is used for anything security-bearing.
+md-5 = "0.10"
+sha1 = "0.10"
 # Pure-Rust inflate (miniz_oxide), for the gzip handler. No C toolchain needed.
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
@@ -32,3 +36,6 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+md-5 = "0.10"

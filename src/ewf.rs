@@ -28,6 +28,13 @@ struct Chunk {
     compressed: bool,
 }
 
+/// Hashes the acquisition recorded inside the image.
+#[derive(Default, Clone)]
+pub struct StoredHashes {
+    pub md5: Option<[u8; 16]>,
+    pub sha1: Option<[u8; 20]>,
+}
+
 pub struct EwfReader {
     segments: Vec<PathBuf>,
     files: Vec<File>,
@@ -36,6 +43,8 @@ pub struct EwfReader {
     chunk_size: u64,
     pub size: u64,
     pub path: String,
+    /// MD5/SHA-1 written by the acquisition tool, for --verify.
+    pub stored_hashes: StoredHashes,
 }
 
 fn u32le(b: &[u8], o: usize) -> u64 {
@@ -162,6 +171,7 @@ impl EwfReader {
             chunk_size: 0,
             size: 0,
             path: path.to_string(),
+            stored_hashes: StoredHashes::default(),
         };
         r.parse()?;
         Ok(r)
@@ -234,6 +244,20 @@ impl EwfReader {
                         }
                     }
                     b"table" => self.parse_table(sidx, data_off),
+                    // "hash" carries MD5; "digest" carries MD5 then SHA-1.
+                    b"hash" => {
+                        let body = self.read_at(sidx, data_off, 16);
+                        if body.len() == 16 && self.stored_hashes.md5.is_none() {
+                            self.stored_hashes.md5 = Some(body.try_into().unwrap());
+                        }
+                    }
+                    b"digest" => {
+                        let body = self.read_at(sidx, data_off, 36);
+                        if body.len() == 36 {
+                            self.stored_hashes.md5 = Some(body[..16].try_into().unwrap());
+                            self.stored_hashes.sha1 = Some(body[16..36].try_into().unwrap());
+                        }
+                    }
                     _ => {}
                 }
                 if next_off == 0 || next_off == offset {

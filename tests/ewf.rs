@@ -191,3 +191,138 @@ fn source_routes_e01_to_the_ewf_reader_and_carves_it() {
     assert_eq!(carved[0].offset, 1024);
     assert_eq!(carved[0].size, png.len() as u64);
 }
+
+// ------------------------------------------------------------ verification
+
+fn ewfacquire() -> Option<String> {
+    for cand in [
+        "ewfacquire",
+        "/opt/homebrew/bin/ewfacquire",
+        "/usr/bin/ewfacquire",
+    ] {
+        if std::process::Command::new(cand).arg("-h").output().is_ok() {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+#[test]
+fn verify_matches_the_hashes_the_acquisition_recorded() {
+    let Some(tool) = ewfacquire() else {
+        eprintln!("skipping: ewfacquire not installed");
+        return;
+    };
+    let dir = Tmp::new("verify");
+    // Whole sectors, as any real disk is: some acquisition tools hash bytes
+    // they do not store when the source is not sector-aligned.
+    let mut data = Vec::new();
+    while data.len() < 600 << 10 {
+        data.extend_from_slice(&builders::Rng::new(51).bytes(8 << 10));
+        data.extend_from_slice(&builders::make_png());
+    }
+    data.resize(data.len().div_ceil(512) * 512, 0);
+    let raw = dir.join("raw.img");
+    std::fs::write(&raw, &data).unwrap();
+    let stem = dir.join("img");
+    let out = std::process::Command::new(&tool)
+        .args([
+            "-u",
+            "-t",
+            stem.to_str().unwrap(),
+            "-f",
+            "encase6",
+            "-c",
+            "best",
+            "-b",
+            "64",
+            "-d",
+            "sha1",
+            raw.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ewfacquire failed");
+
+    let src = Source::open(dir.join("img.E01").to_str().unwrap()).unwrap();
+    let stored = src.stored_hashes();
+    assert!(stored.md5.is_some(), "no stored MD5 in the image");
+    assert!(
+        stored.sha1.is_some(),
+        "no stored SHA-1 (acquired with -d sha1)"
+    );
+
+    let outcome = breadcrumb_rs::verify::verify(&src, |_, _| {}).expect("verify failed");
+    assert_eq!(outcome.bytes, data.len() as u64);
+    assert_eq!(
+        outcome.matches(),
+        Some(true),
+        "hashes did not match the image"
+    );
+    // and the recomputed MD5 really is the source's
+    let expect: [u8; 16] = {
+        use md5::{Digest, Md5};
+        Md5::digest(&data).into()
+    };
+    assert_eq!(outcome.md5, expect);
+}
+
+#[test]
+fn verify_catches_a_modified_image() {
+    let Some(tool) = ewfacquire() else {
+        eprintln!("skipping: ewfacquire not installed");
+        return;
+    };
+    let dir = Tmp::new("verifybad");
+    let mut data = builders::Rng::new(52).bytes(200 << 10);
+    data.resize(data.len().div_ceil(512) * 512, 0);
+    let raw = dir.join("raw.img");
+    std::fs::write(&raw, &data).unwrap();
+    let stem = dir.join("img");
+    assert!(std::process::Command::new(&tool)
+        .args([
+            "-u",
+            "-t",
+            stem.to_str().unwrap(),
+            "-f",
+            "encase6",
+            "-c",
+            "none",
+            "-b",
+            "64",
+            raw.to_str().unwrap()
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // Flip a byte inside the stored chunk data, the way bit rot or a partial
+    // copy would, and check the stored hash notices.
+    let path = dir.join("img.E01");
+    let mut image = std::fs::read(&path).unwrap();
+    let at = image.len() / 2;
+    image[at] ^= 0xFF;
+    std::fs::write(&path, &image).unwrap();
+
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+    // A flip inside a table or header can make the image unreadable, which is
+    // also a detection -- just a louder one.
+    if let Ok(outcome) = breadcrumb_rs::verify::verify(&src, |_, _| {}) {
+        assert_eq!(
+            outcome.matches(),
+            Some(false),
+            "a modified image verified clean"
+        );
+    }
+}
+
+#[test]
+fn a_raw_image_has_nothing_to_verify_against() {
+    let dir = Tmp::new("verifyraw");
+    let path = dir.join("plain.dd");
+    std::fs::write(&path, [0x41u8; 4096]).unwrap();
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+    let outcome = breadcrumb_rs::verify::verify(&src, |_, _| {}).unwrap();
+    assert_eq!(outcome.matches(), None);
+}

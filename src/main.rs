@@ -43,6 +43,8 @@ options:
       --timeline FILE     write a timeline CSV
       --html FILE         write an HTML report
       --hash-source       hash the whole source for the manifest (custody)
+      --verify            recompute the image hashes and compare them with the
+                          ones the acquisition recorded, then exit
       --bitlocker-recovery-key KEY
                           unlock BitLocker volume(s) with a 48-digit key
       --bitlocker-password PASS
@@ -173,6 +175,7 @@ fn run() -> Result<ExitCode, String> {
     let mut scan_metadata = false;
     let mut hexdump: Option<(u64, usize)> = None;
     let mut dump_fve = false;
+    let mut verify = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -239,6 +242,7 @@ fn run() -> Result<ExitCode, String> {
             "--timeline" => timeline_path = Some(next(&mut i)?),
             "--html" => html_path = Some(next(&mut i)?),
             "--hash-source" => hash_source = true,
+            "--verify" => verify = true,
             "--bitlocker-recovery-key" => {
                 let key = next(&mut i)?;
                 // Fail on a malformed key here rather than after a long scan.
@@ -398,6 +402,10 @@ fn run() -> Result<ExitCode, String> {
             );
         }
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if verify {
+        return verify_image(&reader, opts.quiet);
     }
 
     if list_partitions {
@@ -581,6 +589,61 @@ fn run() -> Result<ExitCode, String> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Print a verification report and choose the exit code from it.
+fn verify_image(reader: &Source, quiet: bool) -> Result<ExitCode, String> {
+    use breadcrumb_rs::verify::{self, hex};
+
+    let mut last_pct = u64::MAX;
+    let outcome = verify::verify(reader, |done, total| {
+        if !quiet {
+            let pct = done * 100 / total.max(1);
+            if pct != last_pct {
+                eprint!("\rverifying {pct}%");
+                last_pct = pct;
+            }
+        }
+    })?;
+    if !quiet {
+        eprintln!("\rverifying done");
+    }
+    if let Some(want) = outcome.stored_md5 {
+        let good = want == outcome.md5;
+        println!(
+            "md5    {}  {}  (stored {})",
+            hex(&outcome.md5),
+            if good { "MATCH" } else { "MISMATCH" },
+            hex(&want)
+        );
+    }
+    if let Some(want) = outcome.stored_sha1 {
+        let good = want == outcome.sha1;
+        println!(
+            "sha1   {}  {}  (stored {})",
+            hex(&outcome.sha1),
+            if good { "MATCH" } else { "MISMATCH" },
+            hex(&want)
+        );
+    }
+    println!(
+        "sha256 {}  (recomputed; nothing stored to compare)",
+        hex(&outcome.sha256)
+    );
+    println!("{} bytes verified", outcome.bytes);
+    match outcome.matches() {
+        Some(true) => Ok(ExitCode::SUCCESS),
+        Some(false) => Err("the image does not match the hashes recorded when it \
+                            was acquired. If the source was not a whole number of \
+                            sectors, some acquisition tools hash bytes they do not \
+                            store, which shows up here as a mismatch"
+            .into()),
+        None => Err(
+            "this image carries no acquisition hashes to verify against \
+                     (EWF stores them; raw images do not)"
+                .into(),
+        ),
+    }
 }
 
 /// SHA-256 over every byte of the source, for chain-of-custody records.
