@@ -594,9 +594,12 @@ impl Volume {
         // The first header_sectors hold BDE boot code; the real (encrypted)
         // originals live at volume_header_offset.
         if vpos < self.header_bytes && self.header_src != 0 {
-            let at = self.header_src + vpos;
-            let ct = src.pread(at, ss as usize);
-            return self.cipher.decrypt_sector(at / ss, &ct);
+            // volume_header_offset is volume-relative, like every other offset
+            // in the metadata, so the read needs the volume base added -- while
+            // the sector number that encrypted it does not.
+            let within = self.header_src + vpos;
+            let ct = src.pread(self.base + within, ss as usize);
+            return self.cipher.decrypt_sector(within / ss, &ct);
         }
         let mut ct = src.pread(self.base + vpos, ss as usize);
         ct.resize(ss as usize, 0);
