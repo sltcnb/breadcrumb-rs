@@ -57,12 +57,16 @@ jobs:
           path: fuzz/target
           key: fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
           restore-keys: fuzz-${{ runner.os }}-
+      # The prebuilt cargo-fuzz is a musl binary, and left alone it builds for
+      # its own triple -- where the sanitizer cannot link against a static libc.
+      # Name the target instead of inheriting it.
       - name: Build the fuzz targets
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
       - name: Short campaign on each target
         run: |
           for t in handlers ewf fve artifacts filesystems; do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" \
+              -- -max_total_time=60 -rss_limit_mb=2048
           done
 
   msrv:

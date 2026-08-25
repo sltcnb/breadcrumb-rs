@@ -120,14 +120,18 @@ fn auto_recovers_from_all_three_volumes_in_one_run() {
             .iter()
             .find(|r| r.starts_with(&format!("{vol},{fs},")) && r.contains(name))
             .unwrap_or_else(|| panic!("volume {vol} ({fs}) missing {name}:\n{text}"));
-        let path = hit.rsplit(',').next().unwrap();
+        let path = std::path::PathBuf::from(hit.rsplit(',').next().unwrap());
+        // Compare path components, not text: Windows separates them with `\`.
         assert!(
-            path.contains(&format!("volume{vol}/")),
-            "{fs} wrote outside its own volume's directory: {path}"
+            path.components()
+                .any(|c| c.as_os_str() == format!("volume{vol}").as_str()),
+            "{fs} wrote outside its own volume's directory: {}",
+            path.display()
         );
         assert!(
-            std::fs::metadata(path).is_ok(),
-            "reported file is not on disk: {path}"
+            std::fs::metadata(&path).is_ok(),
+            "reported file is not on disk: {}",
+            path.display()
         );
     }
 
