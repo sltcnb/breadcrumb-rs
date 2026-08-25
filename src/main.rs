@@ -60,6 +60,32 @@ options:
   -h, --help              this help
 
 Sizes accept K/M/G suffixes (e.g. --chunk 64M).
+
+by scenario
+  documents off a disk image
+    bcrumb-rs disk.dd -t office -o out
+  ...that is BitLocker-encrypted (E01 sets: pass the FIRST segment only)
+    bcrumb-rs disk.E01 -t office -o out --bitlocker-recovery-key 650441-...-609257
+  what is on the disk before committing to a long scan
+    bcrumb-rs disk.E01 --list-partitions
+  inventory first: how much would a full carve write?
+    bcrumb-rs disk.E01 --dry-run -t office
+  a big disk, all cores, output somewhere with room
+    bcrumb-rs disk.E01 -j 0 -o /mnt/scratch/out
+  find a keyword, in ASCII and UTF-16LE
+    bcrumb-rs disk.E01 --grep secret-project --max-hits 50
+  a case file: CSV, timeline, HTML report and a custody hash
+    bcrumb-rs disk.dd -o out --csv files.csv --timeline t.csv --html r.html --hash-source
+  read from a pipe (spooled to a temp file, since handlers seek)
+    dd if=/dev/sdb | bcrumb-rs - -o out
+  inspect a structure by hand, decrypted
+    bcrumb-rs disk.E01 --hexdump 0xe500000:512 --bitlocker-recovery-key ...
+  a BitLocker volume that will not open
+    bcrumb-rs disk.E01 --dump-fve --bitlocker-recovery-key ...
+    bcrumb-rs disk.E01 --bitlocker-scan-metadata --bitlocker-recovery-key ...
+
+Filenames, timestamps and deletion dates need the filesystem, not carving:
+use the Python implementation (--ntfs, --deleted-times).
 ";
 
 fn parse_size(s: &str) -> Result<u64, String> {
