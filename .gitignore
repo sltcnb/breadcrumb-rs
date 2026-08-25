@@ -1,6 +1,8 @@
 /target
 Cargo.lock.orig
 *.img
+# ...but the test fixtures are filesystem images on purpose, and CI needs them.
+!tests/fixtures/**
 carved/
 fuzz/target
 fuzz/corpus
