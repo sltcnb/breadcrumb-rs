@@ -51,6 +51,8 @@ options:
                           directory entries (names, sizes, timestamps)
       --ext4              ext2/3/4 undelete: names from directory blocks,
                           content from inodes whose map survived
+      --hfs               HFS+/HFSX undelete: catalog B-tree walk, including
+                          records left outside the live tree
       --include-live      with an undelete mode, also recover files in use
       --deleted-times     when files were deleted, from $Recycle.Bin/$I records
                           and the $UsnJrnl change journal (writes deletions.csv)
@@ -107,6 +109,8 @@ by scenario
     bcrumb-rs card.dd --fat -o out --csv files.csv
   a Linux volume (ext2/3/4)
     bcrumb-rs disk.dd --ext4 -o out --csv files.csv
+  an older Mac volume (HFS+)
+    bcrumb-rs disk.dd --hfs -o out --csv files.csv
   when files were deleted (recycle bin + change journal)
     bcrumb-rs disk.E01 --deleted-times -o out
   ...from artefacts already pulled off a machine
@@ -317,6 +321,7 @@ fn run() -> Result<ExitCode, String> {
     let mut ntfs_mode = false;
     let mut fat_mode = false;
     let mut ext_mode = false;
+    let mut hfs_mode = false;
     let mut include_live = false;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
@@ -397,6 +402,7 @@ fn run() -> Result<ExitCode, String> {
             "--ntfs" => ntfs_mode = true,
             "--fat" | "--exfat" => fat_mode = true,
             "--ext4" | "--ext" => ext_mode = true,
+            "--hfs" | "--hfsplus" => hfs_mode = true,
             "--include-live" => include_live = true,
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
@@ -619,6 +625,10 @@ fn run() -> Result<ExitCode, String> {
 
     if ext_mode {
         return run_ext4(&reader, &opts, include_live, machine, csv_path.as_deref());
+    }
+
+    if hfs_mode {
+        return run_hfs(&reader, &opts, include_live, machine, csv_path.as_deref());
     }
 
     if list_partitions {
@@ -1186,6 +1196,128 @@ fn run_ext4(
                 summary.map_gone
             );
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// HFS+/HFSX undelete.
+fn run_hfs(
+    reader: &Source,
+    opts: &Options,
+    include_live: bool,
+    machine: bool,
+    csv_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::hfs;
+
+    let started = Instant::now();
+    let quiet = opts.quiet;
+    let hopts = hfs::Options {
+        out_dir: opts.out_dir.clone(),
+        dry_run: opts.dry_run,
+        include_live,
+        min_size: opts.min_size,
+        scan_volume: true,
+    };
+    let (records, summary) = hfs::recover(reader, opts.start, &hopts, |rec| {
+        if machine {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("file")),
+                    ("name", json::string(&rec.name)),
+                    ("cnid", json::number(rec.cnid)),
+                    ("size", json::number(rec.size)),
+                    ("sha256", json::string(&rec.sha256)),
+                    ("deleted", json::boolean(rec.deleted)),
+                    ("validated", json::boolean(rec.validated)),
+                    ("created", json::number(rec.timestamps.created)),
+                    ("modified", json::number(rec.timestamps.modified)),
+                    ("path", json::string(&rec.path)),
+                ])
+            );
+        } else if !quiet {
+            eprintln!(
+                "[+] {}  {} B{}",
+                rec.name,
+                rec.size,
+                if rec.validated {
+                    ""
+                } else {
+                    "  (low confidence: beyond the catalog's eight extents)"
+                }
+            );
+        }
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let files: Vec<String> = records
+        .iter()
+        .map(|r| {
+            json::object(vec![
+                ("type", json::string("hfs+")),
+                ("ext", json::string(&r.ext)),
+                ("cnid", json::number(r.cnid)),
+                ("name", json::string(&r.name)),
+                ("size", json::number(r.size)),
+                ("sha256", json::string(&r.sha256)),
+                ("deleted", json::boolean(r.deleted)),
+                ("validated", json::boolean(r.validated)),
+                ("confidence", json::string(r.confidence())),
+                ("created", json::number(r.timestamps.created)),
+                ("modified", json::number(r.timestamps.modified)),
+                ("accessed", json::number(r.timestamps.accessed)),
+                ("path", json::string(&r.path)),
+            ])
+        })
+        .collect();
+    let manifest = json::object(vec![
+        ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
+        ("mode", json::string("hfs+")),
+        ("source", json::string(reader.path())),
+        ("source_size", json::number(reader.size())),
+        ("volume_size", json::number(summary.volume_size)),
+        ("block_size", json::number(summary.block_size)),
+        ("node_size", json::number(summary.node_size)),
+        ("records_outside_the_tree", json::number(summary.from_slack)),
+        ("elapsed_s", json::float(elapsed)),
+        ("files", json::array(files)),
+    ]);
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
+        let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
+        std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(csv) = csv_path {
+            let mut out = String::from(
+                "cnid,name,ext,size,sha256,deleted,confidence,created,modified,accessed,path\n",
+            );
+            for r in &records {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}\n",
+                    r.cnid,
+                    r.name.replace(',', ";"),
+                    r.ext,
+                    r.size,
+                    r.sha256,
+                    r.deleted,
+                    r.confidence(),
+                    r.timestamps.created,
+                    r.timestamps.modified,
+                    r.timestamps.accessed,
+                    r.path.replace(',', ";")
+                ));
+            }
+            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        }
+    } else {
+        println!("{manifest}");
+    }
+    if !opts.quiet {
+        let deleted = records.iter().filter(|r| r.deleted).count();
+        eprintln!(
+            "recovered {} file(s) ({deleted} deleted) from HFS+ in {elapsed:.2}s",
+            records.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

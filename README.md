@@ -188,6 +188,30 @@ A file whose map has holes is written with the holes zero-filled and reported at
 low confidence. Inline-data inodes (content stored inside the inode) and
 encrypted inodes are skipped rather than guessed at.
 
+## HFS+ undelete
+
+```sh
+bcrumb-rs disk.dd --hfs -o out --csv files.csv
+```
+
+The catalog B-tree holds a name, a parent and the fork extents for every file.
+Deleting one takes its offset out of its node's record array; the record itself
+often stays where it was. So records are read by their own shape rather than
+through that array — which is exactly what a deleted record is no longer in —
+and whether a record is still listed there is how live and deleted are told
+apart. The whole volume is then swept for catalog nodes that are no longer part
+of the tree: journal copies, and nodes the tree compacted away.
+
+Only the eight extents in the catalog record are followed. A file fragmented
+beyond that continues in the extents-overflow file, which is not walked, so it
+comes back truncated and marked low confidence rather than passed off as whole.
+
+**What to expect**: deleting a file through macOS on a journaled HFS+ volume
+often leaves no catalog record at all. Measured while building this: of 100
+files deleted that way, 0 names were still anywhere on the volume. When that is
+what happened, this mode has nothing to work with and carving is the only route
+left — the file's *content* usually is still there.
+
 ## When files were deleted
 
 NTFS records four timestamps per file and none of them is "deleted": the MFT
@@ -289,8 +313,8 @@ bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 This is the carving core only. For any of the following, use the Python
 implementation — it remains the reference and the more complete tool:
 
-- **HFS+ / APFS undelete** — NTFS, FAT/exFAT and ext2/3/4 are done (above);
-  Apple filesystems and the `--auto` whole-disk sweep are not ported yet
+- **APFS undelete** — NTFS, FAT/exFAT, ext2/3/4 and HFS+ are done (above);
+  APFS and the `--auto` whole-disk sweep are not ported yet
 - **ext4 journal replay** — where a freed inode's extent tree has been cleared,
   the journal may still hold the pre-delete inode. `--ext4` reports how many
   files are in that state; it does not replay the journal to get them back

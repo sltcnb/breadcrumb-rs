@@ -16,6 +16,7 @@ pub mod ext4;
 pub mod fat;
 pub mod grep;
 pub mod handlers;
+pub mod hfs;
 pub mod images;
 pub mod json;
 pub mod jsonin;
