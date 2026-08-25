@@ -14,6 +14,7 @@ pub mod grep;
 pub mod handlers;
 pub mod images;
 pub mod json;
+pub mod ntfs;
 pub mod partition;
 pub mod reader;
 pub mod report;

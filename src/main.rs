@@ -38,6 +38,9 @@ options:
                           (repeatable; both ASCII and UTF-16LE are matched)
   -i, --ignore-case       case-insensitive --grep
       --max-hits N        stop after N --grep hits
+      --ntfs              NTFS undelete: walk the MFT for deleted files,
+                          recovering names, paths and timestamps
+      --include-live      with --ntfs, also recover files still in use
       --list-partitions   print the partition table and detected filesystems
       --csv FILE          write a CSV of the carve results
       --bodyfile FILE     write a Sleuth Kit bodyfile
@@ -75,6 +78,8 @@ by scenario
     bcrumb-rs disk.dd -t office -o out
   ...that is BitLocker-encrypted (E01 sets: pass the FIRST segment only)
     bcrumb-rs disk.E01 -t office -o out --bitlocker-recovery-key 650441-...-609257
+  filenames, paths and timestamps instead of bytes (NTFS)
+    bcrumb-rs disk.E01 --ntfs -o out --csv files.csv
   what is on the disk before committing to a long scan
     bcrumb-rs disk.E01 --list-partitions
   inventory first: how much would a full carve write?
@@ -93,8 +98,8 @@ by scenario
     bcrumb-rs disk.E01 --dump-fve --bitlocker-recovery-key ...
     bcrumb-rs disk.E01 --bitlocker-scan-metadata --bitlocker-recovery-key ...
 
-Filenames, timestamps and deletion dates need the filesystem, not carving:
-use the Python implementation (--ntfs, --deleted-times).
+Carving gives bytes; --ntfs gives names, paths and timestamps. Deletion times
+(recycle bin, change journal) are not ported yet.
 ";
 
 /// Split the outstanding work into ranges, aligned to the scan chunk size so a
@@ -250,6 +255,8 @@ fn run() -> Result<ExitCode, String> {
     let mut dump_fve = false;
     let mut verify = false;
     let mut resume = false;
+    let mut ntfs_mode = false;
+    let mut include_live = false;
     let mut i = 0;
 
     while i < argv.len() {
@@ -310,6 +317,8 @@ fn run() -> Result<ExitCode, String> {
                 let v = next(&mut i)?;
                 max_hits = v.parse().map_err(|_| format!("not a number: {v:?}"))?;
             }
+            "--ntfs" => ntfs_mode = true,
+            "--include-live" => include_live = true,
             "--list-partitions" | "--list-parts" => list_partitions = true,
             "--csv" => csv_path = Some(next(&mut i)?),
             "--bodyfile" => bodyfile_path = Some(next(&mut i)?),
@@ -481,6 +490,10 @@ fn run() -> Result<ExitCode, String> {
 
     if verify {
         return verify_image(&reader, opts.quiet);
+    }
+
+    if ntfs_mode {
+        return run_ntfs(&reader, &opts, include_live, machine, csv_path.as_deref());
     }
 
     if list_partitions {
@@ -705,6 +718,152 @@ fn run() -> Result<ExitCode, String> {
             elapsed,
             mibs,
             manifest_path
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// NTFS undelete: recover deleted files with their names and timestamps.
+///
+/// Carving finds content; this finds files. Where the MFT still describes a
+/// deleted file, its name, directory path and four timestamps come back with
+/// it, and a fragmented file is reassembled from its runlist instead of being
+/// carved as its first fragment plus junk.
+fn run_ntfs(
+    reader: &Source,
+    opts: &Options,
+    include_live: bool,
+    machine: bool,
+    csv_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    use breadcrumb_rs::ntfs;
+
+    // The volume may be the whole image, or a partition of it.
+    let mut base = opts.start;
+    if base == 0 && breadcrumb_rs::partition::detect_fs(reader, 0) != "ntfs" {
+        let parts = breadcrumb_rs::partition::parse(reader);
+        match parts.iter().find(|p| p.fstype == "ntfs") {
+            Some(p) => {
+                if !opts.quiet {
+                    eprintln!("ntfs: volume at {:#x} ({})", p.start, p.name);
+                }
+                base = p.start;
+            }
+            None => {
+                return Err("no NTFS volume found; pass --offset to point at one \
+                            (--list-partitions shows what is here)"
+                    .into())
+            }
+        }
+    }
+
+    let nopts = ntfs::Options {
+        out_dir: opts.out_dir.clone(),
+        dry_run: opts.dry_run,
+        include_live,
+        min_size: opts.min_size,
+    };
+    let started = Instant::now();
+    let quiet = opts.quiet;
+    let records = ntfs::recover(reader, base, &nopts, |rec| {
+        if machine {
+            println!(
+                "{}",
+                json::object(vec![
+                    ("event", json::string("file")),
+                    ("name", json::string(&rec.name)),
+                    ("mft", json::number(rec.mft)),
+                    ("size", json::number(rec.size)),
+                    ("sha256", json::string(&rec.sha256)),
+                    ("deleted", json::boolean(rec.deleted)),
+                    ("created", json::number(rec.timestamps.created)),
+                    ("modified", json::number(rec.timestamps.modified)),
+                    ("changed", json::number(rec.timestamps.changed)),
+                    ("accessed", json::number(rec.timestamps.accessed)),
+                    ("path", json::string(&rec.path)),
+                ])
+            );
+        } else if !quiet {
+            eprintln!(
+                "[+] {}  {} B{}",
+                rec.name,
+                rec.size,
+                if rec.validated {
+                    ""
+                } else {
+                    "  (low confidence)"
+                }
+            );
+        }
+    })?;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    // Manifest and CSV carry the timestamps, which is the point of this mode.
+    let files: Vec<String> = records
+        .iter()
+        .map(|r| {
+            json::object(vec![
+                ("type", json::string("ntfs")),
+                ("ext", json::string(&r.ext)),
+                ("mft", json::number(r.mft)),
+                ("name", json::string(&r.name)),
+                ("size", json::number(r.size)),
+                ("sha256", json::string(&r.sha256)),
+                ("deleted", json::boolean(r.deleted)),
+                ("validated", json::boolean(r.validated)),
+                ("confidence", json::string(r.confidence())),
+                ("created", json::number(r.timestamps.created)),
+                ("modified", json::number(r.timestamps.modified)),
+                ("changed", json::number(r.timestamps.changed)),
+                ("accessed", json::number(r.timestamps.accessed)),
+                ("path", json::string(&r.path)),
+            ])
+        })
+        .collect();
+    let manifest = json::object(vec![
+        ("tool", json::string(&format!("breadcrumb-rs {VERSION}"))),
+        ("mode", json::string("ntfs")),
+        ("source", json::string(reader.path())),
+        ("source_size", json::number(reader.size())),
+        ("volume_offset", json::number(base)),
+        ("elapsed_s", json::float(elapsed)),
+        ("files", json::array(files)),
+    ]);
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
+        let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
+        std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(csv) = csv_path {
+            let mut out = String::from(
+                "mft,name,ext,size,sha256,deleted,confidence,created,modified,changed,accessed,path\n",
+            );
+            for r in &records {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    r.mft,
+                    r.name.replace(',', ";"),
+                    r.ext,
+                    r.size,
+                    r.sha256,
+                    r.deleted,
+                    r.confidence(),
+                    r.timestamps.created,
+                    r.timestamps.modified,
+                    r.timestamps.changed,
+                    r.timestamps.accessed,
+                    r.path.replace(',', ";")
+                ));
+            }
+            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        }
+    } else {
+        println!("{manifest}");
+    }
+    if !opts.quiet {
+        let deleted = records.iter().filter(|r| r.deleted).count();
+        eprintln!(
+            "recovered {} file(s) ({deleted} deleted) in {elapsed:.2}s",
+            records.len()
         );
     }
     Ok(ExitCode::SUCCESS)

@@ -107,13 +107,39 @@ directory, then the EOCD — never by searching forward for a trailing
 carves everything in between. An archive that cannot be resolved is bounded by
 the members actually accounted for and reported unvalidated.
 
+## NTFS undelete
+
+Carving finds file *content* by its bytes, which is why every carved file is
+named `f_<offset>.<ext>`. `--ntfs` finds files by their *metadata* instead, and
+recovers what carving cannot:
+
+```sh
+bcrumb-rs disk.E01 --ntfs -o out --csv files.csv \
+    --bitlocker-recovery-key 650441-...-609257
+```
+
+- **original names and directory paths**, rebuilt by walking parent references
+- **timestamps**: created, modified, MFT-changed, accessed
+- **fragmented files intact** — the runlist says where every piece is, where a
+  carve would return the first fragment plus whatever follows it
+- named data streams, as `path~stream`
+
+The volume is found automatically (whole-image NTFS, or the first NTFS partition
+in the table); `--offset` points at one directly. `--include-live` recovers files
+still in use as well as deleted ones.
+
+Two things it will not do, both deliberate: a compressed or encrypted stream is
+skipped rather than written out as garbage, and a file whose clusters have been
+reused since deletion comes back with whatever is there now, flagged low
+confidence — never silently.
+
 ## Not ported
 
 This is the carving core only. For any of the following, use the Python
 implementation — it remains the reference and the more complete tool:
 
-- **Filesystem undelete modes** — NTFS / ext4 / FAT / HFS+ / APFS metadata
-  recovery (`--ntfs`, `--auto`, …), which recover names and timestamps
+- **ext4 / FAT / HFS+ / APFS undelete** — NTFS is done (above); the others and
+  the `--auto` whole-disk sweep are not ported yet
 - **VHD/VHDX, Ex01/EWF2, L01, AFF.** Raw images, block devices, EWF
   (`.E01`/`.s01`) sets, QCOW2, sparse VMDK, split raw and stdin are all read
   here; what is left is refused outright, by magic and by extension, because
