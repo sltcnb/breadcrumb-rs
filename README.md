@@ -480,6 +480,12 @@ its window is rejected, so one arithmetic slip in one of 28 parsers cannot write
 unrelated disk into evidence. The first run of the mutation fuzz found exactly
 that — a corrupted PNG chunk length yielding 16 KB from an 80-byte window.
 
+Fuzzing has paid for itself three times so far: that PNG over-read, an overflow
+in the VMDK grain-table geometry, and a 185-byte EWF file whose section chain
+pointed in a cycle — the parser followed it for half an hour before the campaign
+timed out. Sections must now move forward, and every one of those inputs is in
+the regression corpus.
+
 ## Verifying the image first
 
 EWF stores the MD5, and usually the SHA-1, computed while the disk was read.

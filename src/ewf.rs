@@ -219,7 +219,18 @@ impl EwfReader {
                 )));
             }
             let mut offset: u64 = 13;
+            // Sections form a forward chain, each pointing at the next. A
+            // corrupt or hostile image can point backwards or in a cycle, and
+            // following that walks for ever: cargo-fuzz found a 185-byte file
+            // that kept the parser busy for half an hour. Sections must move
+            // forward, must not repeat, and are capped in number.
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut sections = 0u32;
             loop {
+                if !seen.insert(offset) || sections > (1 << 20) {
+                    break;
+                }
+                sections += 1;
                 let desc = self.read_at(sidx, offset, SECTION_DESC);
                 if desc.len() < SECTION_DESC {
                     break;
@@ -269,7 +280,9 @@ impl EwfReader {
                     }
                     _ => {}
                 }
-                if next_off == 0 || next_off == offset {
+                if next_off <= offset {
+                    // Includes the end of the chain, where the last section
+                    // points at itself, and a zero or backwards pointer.
                     break;
                 }
                 offset = next_off;
