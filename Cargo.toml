@@ -32,6 +32,10 @@ sha1 = "0.10"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
+# Arithmetic on values read from an image must never wrap silently: a wrapped
+# length becomes a nonsense read or an enormous allocation. The parsers use
+# checked arithmetic; this makes anything missed loud rather than subtle.
+overflow-checks = true
 opt-level = 3
 lto = true
 codegen-units = 1

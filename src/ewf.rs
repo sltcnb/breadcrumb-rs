@@ -235,6 +235,15 @@ impl EwfReader {
                         // sector_count(8, or 4 in the SMART/EWF-S01 layout)
                         let spc = u32le(&vol, 8);
                         let bps = u32le(&vol, 12);
+                        // Geometry read from the file: bound it, so a corrupt
+                        // volume section cannot overflow into a nonsense chunk
+                        // size or a huge allocation downstream.
+                        if !(1..=1 << 20).contains(&spc) || bps > 1 << 20 {
+                            return Err(err(format!(
+                                "{}: implausible EWF geometry ({spc} sectors per chunk, {bps} bytes per sector)",
+                                self.segments[sidx].display()
+                            )));
+                        }
                         bytes_per_sector = if bps == 0 { 512 } else { bps };
                         self.chunk_size = spc * bytes_per_sector;
                         if declared_chunks == 0 {

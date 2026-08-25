@@ -189,6 +189,10 @@ impl Qcow2Reader {
         let size = u64be(&hdr, 24);
         let l1_size = u32be(&hdr, 36);
         let l1_offset = u64be(&hdr, 40);
+        // The L1 table size is a header field: bound it before allocating.
+        if l1_size > 1 << 26 {
+            return Err(err("implausible QCOW2 L1 table size"));
+        }
         let raw = read_at(&file, l1_offset, (l1_size * 8) as usize);
         let l1 = (0..l1_size as usize).map(|i| u64be(&raw, i * 8)).collect();
         Ok(Qcow2Reader {
@@ -290,18 +294,32 @@ impl VmdkReader {
         let grain_size = u64le(&h, 20); // in sectors
         let gtes_per_gt = u32le(&h, 44);
         let gd_offset = u64le(&h, 56);
-        if grain_size == 0 || gtes_per_gt == 0 {
+        // Every geometry field here comes off the disk, so each is bounded and
+        // every product checked: a corrupt or hostile header must be an error,
+        // not a wraparound that becomes a huge allocation or a panic. A real
+        // grain is 8..128 sectors and a grain table holds 512 entries, so these
+        // bounds are far past anything a writer emits.
+        if !(1..=1u64 << 20).contains(&grain_size)
+            || !(1..=1u64 << 20).contains(&gtes_per_gt)
+            || cap_sectors > 1u64 << 44
+        {
             return Err(err("implausible VMDK grain geometry"));
         }
-        let per_gt = grain_size * gtes_per_gt;
+        let per_gt = grain_size
+            .checked_mul(gtes_per_gt)
+            .ok_or_else(|| err("VMDK grain geometry overflows"))?;
         let gd_entries = cap_sectors.div_ceil(per_gt);
-        let gd_raw = read_at(&file, gd_offset * 512, (gd_entries * 4) as usize);
+        let gd_bytes = gd_entries
+            .checked_mul(4)
+            .filter(|n| *n <= 1 << 28)
+            .ok_or_else(|| err("VMDK grain directory is implausibly large"))?;
+        let gd_raw = read_at(&file, gd_offset.saturating_mul(512), gd_bytes as usize);
         let gd = (0..gd_entries as usize)
             .map(|i| u32le(&gd_raw, i * 4))
             .collect();
         Ok(VmdkReader {
             file,
-            grain_bytes: grain_size * 512,
+            grain_bytes: grain_size * 512, // bounded above, cannot overflow
             gtes_per_gt,
             gd,
             size: cap_sectors * 512,

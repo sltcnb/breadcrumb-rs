@@ -153,3 +153,42 @@ fn unreadable_containers_are_still_refused() {
         assert!(err.to_string().contains("cannot read"), "{name}: {err}");
     }
 }
+
+#[test]
+fn hostile_container_geometry_is_an_error_not_a_crash() {
+    // Every geometry field in these headers comes off the disk. cargo-fuzz
+    // found a VMDK header whose grain size and grain-table size multiplied
+    // past u64, which panicked before this was bounded.
+    let dir = Tmp::new("geometry");
+
+    let mut vmdk = vec![0u8; 512];
+    vmdk[..4].copy_from_slice(b"KDMV");
+    vmdk[12..20].copy_from_slice(&u64::MAX.to_le_bytes()); // capacity
+    vmdk[20..28].copy_from_slice(&u64::MAX.to_le_bytes()); // grain size
+    vmdk[44..48].copy_from_slice(&u32::MAX.to_le_bytes()); // entries per table
+    let p = dir.join("bad.vmdk");
+    std::fs::write(&p, &vmdk).unwrap();
+    assert!(
+        Source::open(p.to_str().unwrap()).is_err(),
+        "absurd VMDK geometry was accepted"
+    );
+
+    // Plausible but still impossible: a grain directory of billions of entries.
+    let mut vmdk2 = vec![0u8; 512];
+    vmdk2[..4].copy_from_slice(b"KDMV");
+    vmdk2[12..20].copy_from_slice(&(1u64 << 43).to_le_bytes());
+    vmdk2[20..28].copy_from_slice(&1u64.to_le_bytes());
+    vmdk2[44..48].copy_from_slice(&1u32.to_le_bytes());
+    let p2 = dir.join("huge.vmdk");
+    std::fs::write(&p2, &vmdk2).unwrap();
+    assert!(Source::open(p2.to_str().unwrap()).is_err());
+
+    // QCOW2 with an L1 table larger than any real image.
+    let mut qcow = vec![0u8; 104];
+    qcow[..4].copy_from_slice(b"QFI\xfb");
+    qcow[20..24].copy_from_slice(&16u32.to_be_bytes()); // cluster bits
+    qcow[36..40].copy_from_slice(&u32::MAX.to_be_bytes()); // L1 size
+    let p3 = dir.join("bad.qcow2");
+    std::fs::write(&p3, &qcow).unwrap();
+    assert!(Source::open(p3.to_str().unwrap()).is_err());
+}
