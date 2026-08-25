@@ -159,6 +159,35 @@ contiguous.
 Deleted files inside live directories are found too: the directory's own chain
 is intact, so it can be walked to reach the entries in it.
 
+## ext2/3/4 undelete
+
+```sh
+bcrumb-rs disk.dd --ext4 -o out --csv files.csv
+```
+
+Two sources have to be combined, because neither is enough alone. Directory
+blocks map inode numbers to names — including names left in the slack of a
+record whose file was unlinked — so files come back with their original paths.
+The inode holds the size, the block map and the timestamps, and unlike NTFS it
+records *when the file was deleted*.
+
+Both map styles are handled: the ext2/3 pointer list with its three levels of
+indirection, and the ext4 extent tree.
+
+The real limit is what ext4 does on delete: freeing an inode usually clears its
+extent tree, and then the content is no longer on the volume at all. Those files
+are counted and named in the summary rather than written out as zeros —
+
+```
+note: 12 deleted inode(s) had their block map already cleared -- ext4 does that
+when it frees an inode, and the content is not on the volume any more (the
+journal may still hold a copy)
+```
+
+A file whose map has holes is written with the holes zero-filled and reported at
+low confidence. Inline-data inodes (content stored inside the inode) and
+encrypted inodes are skipped rather than guessed at.
+
 ## When files were deleted
 
 NTFS records four timestamps per file and none of them is "deleted": the MFT
@@ -260,8 +289,11 @@ bcrumb-rs --from-manifest out/manifest.json --html report.html --csv files.csv
 This is the carving core only. For any of the following, use the Python
 implementation — it remains the reference and the more complete tool:
 
-- **ext4 / HFS+ / APFS undelete** — NTFS and FAT/exFAT are done (above); the
-  others and the `--auto` whole-disk sweep are not ported yet
+- **HFS+ / APFS undelete** — NTFS, FAT/exFAT and ext2/3/4 are done (above);
+  Apple filesystems and the `--auto` whole-disk sweep are not ported yet
+- **ext4 journal replay** — where a freed inode's extent tree has been cleared,
+  the journal may still hold the pre-delete inode. `--ext4` reports how many
+  files are in that state; it does not replay the journal to get them back
 - **VHD/VHDX, Ex01/EWF2, L01, AFF.** Raw images, block devices, EWF
   (`.E01`/`.s01`) sets, QCOW2, sparse VMDK, split raw and stdin are all read
   here; what is left is refused outright, by magic and by extension, because

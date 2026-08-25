@@ -12,6 +12,7 @@ pub mod checkpoint;
 pub mod crypto;
 pub mod customsig;
 pub mod ewf;
+pub mod ext4;
 pub mod fat;
 pub mod grep;
 pub mod handlers;
