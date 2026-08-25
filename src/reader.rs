@@ -257,23 +257,34 @@ impl Source {
         }))
     }
 
+    /// What was opened, as a parenthesised phrase for the scan banner.
+    ///
+    /// Built by composing the parts rather than unwrapping an inner
+    /// description, which is what produced banners like
+    /// "JL.E01EWF, 92 segment(s, BitLocker unlocked".
     pub fn describe(&self) -> String {
+        let parts = self.describe_parts();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    }
+
+    fn describe_parts(&self) -> Vec<String> {
         match self {
-            Source::Raw(r) if r.is_device => " (device)".into(),
-            Source::Raw(_) => String::new(),
-            Source::Ewf(e) => format!(" (EWF, {} segment(s))", e.segment_count()),
-            Source::Split(s) => format!(" (split raw, {} segment(s))", s.count),
-            Source::Qcow2(_) => " (QCOW2)".into(),
-            Source::Vmdk(_) => " (VMDK sparse)".into(),
-            Source::Stdin(_) => " (spooled from stdin)".into(),
-            Source::BitLocker(b) => format!(
-                "{}, BitLocker unlocked",
-                b.inner
-                    .describe()
-                    .trim_start_matches(' ')
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-            ),
+            Source::Raw(r) if r.is_device => vec!["device".into()],
+            Source::Raw(_) => Vec::new(),
+            Source::Ewf(e) => vec![format!("EWF, {} segments", e.segment_count())],
+            Source::Split(s) => vec![format!("split raw, {} segments", s.count)],
+            Source::Qcow2(_) => vec!["QCOW2".into()],
+            Source::Vmdk(_) => vec!["VMDK sparse".into()],
+            Source::Stdin(_) => vec!["spooled from stdin".into()],
+            Source::BitLocker(b) => {
+                let mut parts = b.inner.describe_parts();
+                parts.push("BitLocker unlocked".into());
+                parts
+            }
         }
     }
 }

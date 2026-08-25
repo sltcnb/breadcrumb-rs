@@ -29,6 +29,10 @@ options:
       --no-skip           also carve files embedded inside other files
       --no-dedup          keep byte-identical duplicates
       --dry-run           inventory only, write nothing
+      --max-output SIZE   stop after writing this much carved data, keeping the
+                          manifest (default: none)
+      --min-free SIZE     stop when the output filesystem has less than this
+                          free (default 2G; 0 disables the check)
       --grep PATTERN      search the source for a string instead of carving
                           (repeatable; both ASCII and UTF-16LE are matched)
   -i, --ignore-case       case-insensitive --grep
@@ -59,7 +63,7 @@ options:
   -V, --version           print version and exit
   -h, --help              this help
 
-Sizes accept K/M/G suffixes (e.g. --chunk 64M).
+Sizes accept K/M/G/T suffixes (e.g. --chunk 64M, --max-output 20G).
 
 by scenario
   documents off a disk image
@@ -88,12 +92,51 @@ Filenames, timestamps and deletion dates need the filesystem, not carving:
 use the Python implementation (--ntfs, --deleted-times).
 ";
 
+/// Bytes free on the filesystem holding `path` (or its nearest existing parent).
+fn free_space(path: &str) -> Option<u64> {
+    let mut probe = std::path::PathBuf::from(path);
+    loop {
+        if probe.exists() {
+            break;
+        }
+        match probe.parent() {
+            Some(p) if !p.as_os_str().is_empty() => probe = p.to_path_buf(),
+            _ => return None,
+        }
+    }
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(&probe)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().nth(1)?;
+    let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb * 1024)
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TiB", 1 << 40),
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (name, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {name}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
         Some('k') | Some('K') => (&s[..s.len() - 1], 1u64 << 10),
         Some('m') | Some('M') => (&s[..s.len() - 1], 1u64 << 20),
         Some('g') | Some('G') => (&s[..s.len() - 1], 1u64 << 30),
+        Some('t') | Some('T') => (&s[..s.len() - 1], 1u64 << 40),
         _ => (s, 1),
     };
     num.parse::<u64>()
@@ -182,6 +225,8 @@ fn run() -> Result<ExitCode, String> {
             "--no-skip" => opts.skip_carved = false,
             "--no-dedup" => opts.dedup = false,
             "--dry-run" => opts.dry_run = true,
+            "--max-output" => opts.max_output = parse_size(&next(&mut i)?)?,
+            "--min-free" => opts.min_free = parse_size(&next(&mut i)?)?,
             "--grep" => grep_patterns.push(next(&mut i)?),
             "-i" | "--ignore-case" => ignore_case = true,
             "--max-hits" => {
@@ -407,6 +452,37 @@ fn run() -> Result<ExitCode, String> {
         );
     }
 
+    // Pre-flight: a carve can outgrow the volume it is written to, and filling
+    // the filesystem takes the machine with it. Warn before starting, and let
+    // the scan stop itself if it gets close.
+    if !opts.dry_run {
+        if opts.min_free == 0 {
+            opts.min_free = 2 << 30; // 2 GiB, unless the operator said otherwise
+        }
+        if let Some(free) = free_space(&opts.out_dir) {
+            if !opts.quiet {
+                eprintln!(
+                    "output: {} free on the target volume, stopping at {} free{}",
+                    human(free),
+                    human(opts.min_free),
+                    match opts.max_output {
+                        0 => String::new(),
+                        n => format!(" or {} written", human(n)),
+                    }
+                );
+            }
+            if free <= opts.min_free {
+                return Err(format!(
+                    "only {} free on {} (below the {} floor); write elsewhere, \
+                     narrow --types, or lower --min-free",
+                    human(free),
+                    opts.out_dir,
+                    human(opts.min_free)
+                ));
+            }
+        }
+    }
+
     let t0 = Instant::now();
     let records = run_parallel(&reader, &sigs, &opts);
     let elapsed = t0.elapsed().as_secs_f64();
@@ -477,6 +553,18 @@ fn run() -> Result<ExitCode, String> {
         );
     }
     if !opts.quiet {
+        let written: u64 = records
+            .iter()
+            .filter(|r| !r.path.is_empty())
+            .map(|r| r.size)
+            .sum();
+        if opts.max_output > 0 && written >= opts.max_output {
+            eprintln!(
+                "stopped at the {} output limit: the scan did not finish, and \
+                 the manifest covers only what was written",
+                human(opts.max_output)
+            );
+        }
         let mibs = reader.size() as f64 / (1 << 20) as f64 / elapsed.max(1e-9);
         let dups = records.iter().filter(|r| r.duplicate_of.is_some()).count();
         eprintln!(

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub struct Record {
@@ -37,6 +38,54 @@ impl Record {
     }
 }
 
+/// Shared limit on what a scan may write.
+///
+/// A carve of a large disk can produce more than the volume it is written to
+/// can hold -- on a 238 GB image an unfiltered run reached 51 GB inside the
+/// first percent and filled the filesystem, which takes the machine down with
+/// it. Workers charge every byte here and stop cleanly when the budget or the
+/// free-space floor is reached, so the manifest still lands.
+#[derive(Default)]
+pub struct OutputBudget {
+    written: AtomicU64,
+    limit: u64,
+    stop: AtomicBool,
+}
+
+impl OutputBudget {
+    pub fn new(limit: u64) -> Self {
+        OutputBudget {
+            written: AtomicU64::new(0),
+            limit,
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    pub fn charge(&self, bytes: u64) {
+        self.written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// Has the scan hit its limit? Sticky, so every worker sees it.
+    pub fn exhausted(&self) -> bool {
+        if self.stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.limit > 0 && self.written() >= self.limit {
+            self.stop.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    pub fn halt(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub out_dir: String,
@@ -53,6 +102,10 @@ pub struct Options {
     pub dedup: bool,
     pub skip_blank: bool,
     pub jobs: usize,
+    /// Stop writing after this many bytes of carved output (0 = no limit).
+    pub max_output: u64,
+    /// Stop when the output filesystem has less than this much free (0 = off).
+    pub min_free: u64,
 }
 
 impl Default for Options {
@@ -72,6 +125,8 @@ impl Default for Options {
             dedup: true,
             skip_blank: true,
             jobs: 1,
+            max_output: 0,
+            min_free: 0,
         }
     }
 }
@@ -79,6 +134,11 @@ impl Default for Options {
 pub struct Carver<'a> {
     reader: &'a Source,
     opts: &'a Options,
+    /// Budget shared with the other workers of a parallel scan.
+    budget: Option<&'a OutputBudget>,
+    /// Budget for a carver used on its own, so the limit holds however the
+    /// scan engine is entered.
+    owned_budget: Option<OutputBudget>,
     matcher: AhoCorasick,
     /// pattern index -> signatures owning that magic
     by_pattern: Vec<Vec<&'static Signature>>,
@@ -114,6 +174,8 @@ impl<'a> Carver<'a> {
         Carver {
             reader,
             opts,
+            budget: None,
+            owned_budget: (opts.max_output > 0).then(|| OutputBudget::new(opts.max_output)),
             matcher,
             by_pattern,
             pattern_len,
@@ -121,6 +183,23 @@ impl<'a> Carver<'a> {
             skipped_blank: 0,
             window_end: 0,
         }
+    }
+
+    /// Share an output budget with the other workers of this scan.
+    pub fn with_budget(mut self, budget: &'a OutputBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// True once the scan should stop writing.
+    pub fn stopped(&self) -> bool {
+        if let Some(b) = self.budget {
+            return b.exhausted();
+        }
+        self.owned_budget
+            .as_ref()
+            .map(|b| b.exhausted())
+            .unwrap_or(false)
     }
 
     pub fn run(&mut self) -> Vec<Record> {
@@ -141,6 +220,9 @@ impl<'a> Carver<'a> {
         let mut next_allowed = o.start;
 
         while pos < scan_end {
+            if self.stopped() {
+                break;
+            }
             let want = (o.chunk_size + overlap).min(scan_end - pos + overlap);
             let buf = self.reader.pread(pos, want as usize);
             if buf.is_empty() {
@@ -162,6 +244,11 @@ impl<'a> Carver<'a> {
                 .filter(|&(i, _)| i < limit)
                 .collect();
             for (i, pat) in hits {
+                // Per candidate, not per chunk: a single 32 MiB chunk can hold
+                // thousands of files, so a chunk-level check overshoots wildly.
+                if self.stopped() {
+                    break;
+                }
                 let abs_magic = pos + i;
                 for sig in self.by_pattern[pat].clone() {
                     if abs_magic < sig.header_offset {
@@ -261,6 +348,13 @@ impl<'a> Carver<'a> {
         if let Some(mut f) = file {
             let _ = f.flush();
         }
+        if !o.dry_run {
+            if let Some(budget) = self.budget {
+                budget.charge(done);
+            } else if let Some(budget) = &self.owned_budget {
+                budget.charge(done);
+            }
+        }
 
         Some(Record {
             kind: sig.name,
@@ -335,9 +429,15 @@ pub fn run_parallel(reader: &Source, sigs: &[&'static Signature], opts: &Options
     };
     let total = scan_end.saturating_sub(opts.start);
     let jobs = opts.jobs.max(1);
+    let budget = OutputBudget::new(opts.max_output);
     if jobs == 1 || total == 0 {
-        let mut c = Carver::new(reader, sigs.to_vec(), opts);
-        return c.run();
+        let mut c = Carver::new(reader, sigs.to_vec(), opts).with_budget(&budget);
+        let out = c.run();
+        let mut out = containment_filter(out);
+        if opts.dedup {
+            dedupe(&mut out, opts.dry_run);
+        }
+        return out;
     }
     let span = total / jobs as u64 + 1;
     let mut out: Vec<Record> = Vec::new();
@@ -357,8 +457,9 @@ pub fn run_parallel(reader: &Source, sigs: &[&'static Signature], opts: &Options
             sub.dedup = false; // one dedup pass over the merged result instead
             sub.jobs = 1;
             let sigs = sigs.to_vec();
+            let budget = &budget;
             handles.push(scope.spawn(move || {
-                let mut c = Carver::new(reader, sigs, &sub);
+                let mut c = Carver::new(reader, sigs, &sub).with_budget(budget);
                 c.run()
             }));
         }

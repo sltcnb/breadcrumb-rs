@@ -662,6 +662,69 @@ fn an_unresolvable_zip_carve_is_bounded() {
 }
 
 #[test]
+fn an_output_budget_stops_the_scan_and_keeps_the_manifest() {
+    // A carve can outgrow the volume it writes to. On a real 238 GB image an
+    // unfiltered run reached 51 GB inside the first percent and filled the
+    // filesystem, which takes the machine with it.
+    let dir = Tmp::new("budget");
+    let mut img = Vec::new();
+    for i in 0..40u32 {
+        img.extend_from_slice(&builders::Rng::new(90 + i as u64).bytes(64 << 10));
+        img.extend_from_slice(&builders::make_png());
+        img.extend_from_slice(&builders::make_jpeg());
+    }
+    let path = write_tmp(&dir, "big.img", &img);
+
+    let unlimited = carve_all(&path, dir.join("all"), |_| {});
+    let capped = carve_all(&path, dir.join("capped"), |o| o.max_output = 1024);
+    assert!(
+        capped.len() < unlimited.len(),
+        "the budget did not stop anything: {} vs {}",
+        capped.len(),
+        unlimited.len()
+    );
+    assert!(!capped.is_empty(), "the budget stopped everything");
+    // What it did write is on disk and accounted for, not half a file.
+    for r in capped.iter().filter(|r| !r.path.is_empty()) {
+        let on_disk = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(on_disk, r.size, "{} truncated", r.path);
+    }
+}
+
+#[test]
+fn the_budget_is_shared_across_workers() {
+    let dir = Tmp::new("budgetpar");
+    let mut img = Vec::new();
+    for i in 0..40u32 {
+        img.extend_from_slice(&builders::Rng::new(30 + i as u64).bytes(64 << 10));
+        img.extend_from_slice(&builders::make_png());
+    }
+    let path = write_tmp(&dir, "big.img", &img);
+    let reader = Source::open(path.to_str().unwrap()).unwrap();
+    let sigs: Vec<_> = SIGNATURES.iter().collect();
+    let opts = Options {
+        out_dir: dir.join("out").to_string_lossy().into(),
+        quiet: true,
+        jobs: 4,
+        chunk_size: 1 << 16,
+        max_output: 512,
+        ..Options::default()
+    };
+    let records = run_parallel(&reader, &sigs, &opts);
+    let written: u64 = records
+        .iter()
+        .filter(|r| !r.path.is_empty())
+        .map(|r| r.size)
+        .sum();
+    // Four workers can each be mid-file when the limit trips, so allow a
+    // margin -- but nothing like an unbounded run.
+    assert!(
+        written < 64 << 10,
+        "workers ignored the shared budget: {written}"
+    );
+}
+
+#[test]
 fn office_group_resolves_to_every_document_container() {
     let names: Vec<&str> = resolve_types("office")
         .unwrap()

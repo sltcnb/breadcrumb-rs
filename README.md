@@ -201,6 +201,27 @@ ciphertext and reporting "0 files" is indistinguishable from an empty disk.
 TPM-only protectors cannot be unlocked from an image by any tool: the key is
 sealed in hardware. Use the recovery key, a `.BEK`, or the FVEK.
 
+## Not filling the disk
+
+A carve can write more than the volume it is written to can hold: on a 238 GB
+image an unfiltered run reached 51 GB inside the first percent. So before
+writing anything the free space is checked, and the scan stops itself rather
+than filling the filesystem:
+
+```
+$ bcrumb-rs disk.E01 -o out -t office
+output: 55.0 GiB free on the target volume, stopping at 2.0 GiB free
+```
+
+- `--min-free SIZE` — floor on free space, default **2 GiB**; the run refuses to
+  start below it and stops when it gets there. `--min-free 0` disables the check.
+- `--max-output SIZE` — hard ceiling on carved bytes. The scan stops cleanly and
+  the manifest still describes everything written, with a line saying the run
+  did not finish.
+
+`--dry-run` writes nothing at all and still produces the manifest, which is the
+cheap way to size a job before committing to it.
+
 ## Usage
 
 ```
