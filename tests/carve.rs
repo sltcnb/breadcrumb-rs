@@ -827,3 +827,49 @@ fn a_stray_zip_header_does_not_search_the_whole_window() {
         "16 stray headers over 64 MB took {elapsed:?}"
     );
 }
+
+#[test]
+fn an_archive_carved_from_its_middle_is_refused() {
+    // The failure this catches was found by checking carved output against
+    // python's zipfile: 821 of 825 archives from a live scan were structurally
+    // perfect and unreadable. A window opening on a member part-way inside an
+    // archive walks that archive's real central directory and real end record,
+    // so everything lines up -- except the archive's own offsets, which point
+    // to before where the carve started.
+    let dir = Tmp::new("zipmid");
+    let whole = builders::zip_with(b"payload/one.txt", &b"content ".repeat(300));
+    let second = whole
+        .windows(4)
+        .skip(4)
+        .position(|w| w == b"PK\x03\x04")
+        .map(|p| p + 4)
+        .expect("archive has a second record");
+
+    // The whole archive still carves.
+    let mut good = vec![0u8; 2048];
+    good.extend_from_slice(&whole);
+    good.extend_from_slice(&[0u8; 2048]);
+    let path = write_tmp(&dir, "whole.dd", &good);
+    let records = carve_all(&path, dir.join("out1"), |o| o.dry_run = true);
+    assert_eq!(
+        records.len(),
+        1,
+        "the whole archive should carve: {records:?}"
+    );
+    assert_eq!(records[0].size, whole.len() as u64);
+
+    // The same archive from a later record does not.
+    let mut mid = vec![0u8; 2048];
+    mid.extend_from_slice(&whole[second..]);
+    mid.extend_from_slice(&[0u8; 2048]);
+    let path = write_tmp(&dir, "mid.dd", &mid);
+    let records = carve_all(&path, dir.join("out2"), |o| o.dry_run = true);
+    assert!(
+        records.is_empty(),
+        "a fragment starting inside an archive was carved: {:?}",
+        records
+            .iter()
+            .map(|r| (r.offset, r.size))
+            .collect::<Vec<_>>()
+    );
+}

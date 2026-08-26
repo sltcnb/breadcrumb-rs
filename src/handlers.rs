@@ -680,13 +680,25 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
                 break;
             }
         }
+        // Where the archive says its own records are, so a carve that started
+        // part-way inside one can be told apart from a whole archive. Both
+        // numbers are relative to the start of the archive, so on a whole
+        // archive they equal the offsets in this window.
+        let mut zip64_eocd_at: Option<u64> = None;
+        let mut declared_zip64_eocd: Option<u64> = None;
         if w.read(pos, 4) == b"PK\x06\x06" {
             // zip64 end of central directory
+            zip64_eocd_at = Some(pos);
             let rec = w.read(pos, 12);
             if rec.len() == 12 {
                 pos += 12 + u64le(&rec, 4);
             }
             if w.read(pos, 4) == b"PK\x06\x07" {
+                let loc = w.read(pos, 20);
+                if loc.len() == 20 {
+                    // The locator carries the offset of the record above.
+                    declared_zip64_eocd = Some(u64le(&loc, 8));
+                }
                 pos += 20; // zip64 locator
             }
         }
@@ -694,9 +706,32 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
             let rec = w.read(pos, 22);
             if rec.len() == 22 {
                 let end = pos + 22 + u16le(&rec, 20); // + archive comment
-                if end <= w.limit {
+                                                      // A carve that began inside an archive walks that archive's
+                                                      // real central directory and its real end record, and looks
+                                                      // perfect -- while missing everything before the member it
+                                                      // started on. On a live scan that was 821 of 825 carved
+                                                      // archives: every one structurally sound and unreadable,
+                                                      // because the archive's own offsets point before its start.
+                let starts_here = match (zip64_eocd_at, declared_zip64_eocd) {
+                    (Some(found), Some(declared)) => found == declared,
+                    // No zip64 records: the plain end record says where the
+                    // central directory is, and the walk knows where it found
+                    // it.
+                    _ => u32le(&rec, 16) == accounted,
+                };
+                if end <= w.limit && starts_here {
                     let ext = zip_ext(w, end);
                     return carve(end, ext, true);
+                }
+                if !starts_here {
+                    // A fragment of a larger archive. The archive's own start
+                    // is earlier in the image and is carved there, whole.
+                    return if zip_partial() {
+                        let ext = zip_ext(w, end.min(w.limit));
+                        carve(end.min(w.limit), ext, false)
+                    } else {
+                        None
+                    };
                 }
             }
         }
