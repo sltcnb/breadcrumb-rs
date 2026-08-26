@@ -848,13 +848,17 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
         search = eocd + 1;
     }
 
-    // No EOCD. If a central directory was parsed, this is an archive that lost
-    // its last record and is worth keeping, unvalidated. If there was no
-    // directory either, these bytes are a fragment of some archive rather than
-    // an archive -- see ZIP_PARTIAL for what that cost on real evidence.
-    if !saw_directory && !zip_partial() {
+    // No end-of-central-directory record. Nothing can open such a file: every
+    // reader starts from that record, so a carve without one is bytes rather
+    // than an archive, whatever structure precedes it. On a live scan 25 of 32
+    // carved archives were this -- local headers, central entries, no end
+    // record, and "File is not a zip file" from every tool.
+    //
+    // Kept only when fragments were asked for, and never called validated.
+    if !zip_partial() {
         return None;
     }
+    let _ = saw_directory;
     let accounted = accounted.min(w.limit).min(ZIP_UNRESOLVED_CAP);
     if accounted == 0 {
         return None;
