@@ -198,7 +198,7 @@ impl Qcow2Reader {
         // than its own L1 table can address. A header claiming 16 exabytes for
         // a 149-byte file had the carver searching a 1.6e19-byte window, which
         // is a hang with no output: cargo-fuzz found exactly that.
-        let addressable = (l1_size as u64)
+        let addressable = l1_size
             .checked_mul(cluster_size / 8)
             .and_then(|clusters| clusters.checked_mul(cluster_size))
             .ok_or_else(|| err("implausible QCOW2 geometry"))?;
