@@ -575,53 +575,63 @@ pub fn run_ranges(
     on_range_done: impl FnMut(u64, u64) + Send,
 ) -> Vec<Record> {
     let budget = OutputBudget::new(opts.max_output);
-    // Ranges finish at different times, and a range that finished should be
+    // Ranges finish at different times, and one that finished should be
     // recorded then rather than when the slowest of its batch does: a live scan
-    // of a 237 GB image had completed nothing after sixteen hours because the
-    // whole batch had to join first, so nothing was resumable.
+    // of a 237 GB image had recorded nothing after sixteen hours because a whole
+    // batch had to join first, so a killed run would have restarted from zero.
     let on_range_done = std::sync::Mutex::new(on_range_done);
-    let mut out: Vec<Record> = Vec::new();
+    let collected: std::sync::Mutex<Vec<Record>> = std::sync::Mutex::new(Vec::new());
     let jobs = opts.jobs.max(1);
-    for chunk in ranges.chunks(jobs.max(1)) {
-        if budget.exhausted() {
-            break;
-        }
-        let mut produced: Vec<(u64, u64, Vec<Record>)> = Vec::new();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for &(start, end) in chunk {
-                let mut sub = opts.clone();
-                sub.start = start;
-                sub.length = end - start;
-                sub.window_end = scan_end; // carve past a range end when needed
-                sub.quiet = true;
-                sub.dedup = false; // one dedup pass over the merged result
-                sub.jobs = 1;
-                let sigs = sigs.to_vec();
-                let budget = &budget;
-                let done = &on_range_done;
-                handles.push(scope.spawn(move || {
-                    let mut c = Carver::new(reader, sigs, &sub).with_budget(budget);
+
+    // A queue rather than fixed batches. Free-space ranges vary from a few KiB
+    // to tens of gigabytes, and with batches every worker waited for the
+    // slowest in its group -- on a fragmented volume that is most of the time
+    // spent idle. Long-lived workers also build the pattern automaton once
+    // instead of once per range, which matters when there are 46,774 of them.
+    let next = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let next = &next;
+            let budget = &budget;
+            let done = &on_range_done;
+            let collected = &collected;
+            let sigs = sigs.to_vec();
+            scope.spawn(move || {
+                let mut mine: Vec<Record> = Vec::new();
+                loop {
+                    if budget.exhausted() {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    let Some(&(start, end)) = ranges.get(i) else {
+                        break;
+                    };
+                    let mut sub = opts.clone();
+                    sub.start = start;
+                    sub.length = end - start;
+                    sub.window_end = scan_end; // carve past a range end when needed
+                    sub.quiet = true;
+                    sub.dedup = false; // one dedup pass over the merged result
+                    sub.jobs = 1;
+                    let mut c = Carver::new(reader, sigs.clone(), &sub).with_budget(budget);
                     if let Some(p) = progress {
                         c = c.with_progress(p);
                     }
-                    let recs = c.run();
+                    mine.extend(c.run());
                     if !budget.exhausted() {
                         if let Ok(mut f) = done.lock() {
                             f(start, end);
                         }
                     }
-                    (start, end, recs)
-                }));
-            }
-            for h in handles {
-                produced.push(h.join().expect("scan worker panicked"));
-            }
-        });
-        for (_start, _end, recs) in produced {
-            out.extend(recs);
+                }
+                if let Ok(mut all) = collected.lock() {
+                    all.extend(mine);
+                }
+            });
         }
-    }
+    });
+
+    let out = collected.into_inner().unwrap_or_default();
     let mut out = containment_filter(out);
     if opts.dedup {
         dedupe(&mut out, opts.dry_run);
