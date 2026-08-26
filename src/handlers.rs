@@ -708,8 +708,21 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
 
     // Fallback: an EOCD whose central-directory arithmetic lines up with this
     // start really is this archive's end. Anything else belongs to another.
+    //
+    // Bounded by what the member walk accounted for: an archive's directory
+    // follows its members, so an EOCD far beyond them belongs to a different
+    // archive. Without a bound this search runs to the end of the window -- 512
+    // MB for a ZIP -- and on an encrypted image inside a compressed container
+    // every byte of it must be decrypted and inflated to be looked at. That is
+    // what a stray PK header cost on a live scan, once per stray header.
+    //
+    // The walk accounts for nothing when the first member is streamed (its size
+    // lives in a trailing data descriptor), which is ordinary in archives
+    // written on the fly, so the bound has to leave room for that rather than
+    // the carve being refused outright.
+    let search_end = accounted.saturating_add(ZIP_UNRESOLVED_CAP).min(w.limit);
     let mut search = 0u64;
-    while let Some(eocd) = w.find(b"PK\x05\x06", search, None) {
+    while let Some(eocd) = w.find(b"PK\x05\x06", search, Some(search_end)) {
         let rec = w.read(eocd, 22);
         if rec.len() == 22 {
             let cd_size = u32le(&rec, 12);

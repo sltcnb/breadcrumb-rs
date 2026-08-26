@@ -789,3 +789,41 @@ fn type_filter_and_aliases_resolve() {
     assert_eq!(names, vec!["jpg", "png", "riff"]);
     assert!(resolve_types("jpg,nosuchtype").is_err());
 }
+
+#[test]
+fn a_stray_zip_header_does_not_search_the_whole_window() {
+    // A ZIP's window is 512 MB. Searching all of it for an end-of-central-
+    // directory record, once per stray PK header, is what made a live scan
+    // crawl: on an encrypted image inside a compressed container every byte
+    // looked at has to be decrypted and inflated first. The search is bounded
+    // by what the member walk accounted for.
+    let dir = Tmp::new("zipsearch");
+    let mut rng = builders::Rng::new(31);
+    let mut blob = rng.bytes(64 << 20);
+    for i in 0..16 {
+        let at = (i + 1) * (3 << 20);
+        blob[at..at + 4].copy_from_slice(b"PK\x03\x04");
+    }
+    let path = write_tmp(&dir, "stray.bin", &blob);
+
+    let started = std::time::Instant::now();
+    let records = carve_all(&path, dir.join("out"), |o| {
+        o.dry_run = true;
+        o.jobs = 1;
+    });
+    let elapsed = started.elapsed();
+    assert!(
+        records.is_empty(),
+        "stray headers produced carves: {:?}",
+        records
+            .iter()
+            .map(|r| (r.offset, r.size))
+            .collect::<Vec<_>>()
+    );
+    // Generous enough not to be flaky on a loaded machine, tight enough that a
+    // full-window search per header (which was ~20x this) fails it.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "16 stray headers over 64 MB took {elapsed:?}"
+    );
+}
