@@ -837,25 +837,22 @@ fn an_archive_carved_from_its_middle_is_refused() {
     // so everything lines up -- except the archive's own offsets, which point
     // to before where the carve started.
     let dir = Tmp::new("zipmid");
-    let whole = builders::zip_with(b"payload/one.txt", &b"content ".repeat(300));
-    let second = whole
-        .windows(4)
-        .skip(4)
-        .position(|w| w == b"PK\x03\x04")
-        .map(|p| p + 4)
+    // A real multi-member archive, written by python's zipfile.
+    let whole = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/validate/valid.docx"),
+    )
+    .expect("fixture missing");
+    let second = (4..whole.len() - 4)
+        .find(|&i| &whole[i..i + 4] == b"PK\x03\x04")
         .expect("archive has a second record");
 
-    // The whole archive still carves.
+    // The whole archive still carves, byte for byte.
     let mut good = vec![0u8; 2048];
     good.extend_from_slice(&whole);
     good.extend_from_slice(&[0u8; 2048]);
     let path = write_tmp(&dir, "whole.dd", &good);
     let records = carve_all(&path, dir.join("out1"), |o| o.dry_run = true);
-    assert_eq!(
-        records.len(),
-        1,
-        "the whole archive should carve: {records:?}"
-    );
+    assert_eq!(records.len(), 1, "the whole archive should carve");
     assert_eq!(records[0].size, whole.len() as u64);
 
     // The same archive from a later record does not.
