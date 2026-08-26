@@ -870,3 +870,71 @@ fn an_archive_carved_from_its_middle_is_refused() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn an_ole_signature_without_a_root_entry_is_not_a_file() {
+    // Every OLE file's directory starts with an entry named "Root Entry". A
+    // D0CF11E0 without one is an embedded object inside another document, or a
+    // coincidence: four of fifteen OLE files from a live scan were exactly that
+    // -- plausible structure, unopenable.
+    let dir = Tmp::new("olename");
+    let good = builders::make_ole("WordDocument");
+    let mut blob = vec![0u8; 1024];
+    blob.extend_from_slice(&good);
+    blob.extend_from_slice(&[0u8; 1024]);
+    let path = write_tmp(&dir, "good.dd", &blob);
+    let records = carve_all(&path, dir.join("out1"), |o| o.dry_run = true);
+    assert_eq!(records.len(), 1, "a real OLE file should carve");
+
+    // The same bytes with the root entry's name scrubbed.
+    let mut broken = good.clone();
+    let sector = 1usize << u16::from_le_bytes([broken[30], broken[31]]);
+    let dir_sect = u32::from_le_bytes([broken[48], broken[49], broken[50], broken[51]]) as usize;
+    let at = (dir_sect + 1) * sector;
+    broken[at..at + 20].copy_from_slice(&[0x41; 20]);
+    let mut blob = vec![0u8; 1024];
+    blob.extend_from_slice(&broken);
+    blob.extend_from_slice(&[0u8; 1024]);
+    let path = write_tmp(&dir, "broken.dd", &blob);
+    let records = carve_all(&path, dir.join("out2"), |o| o.dry_run = true);
+    assert!(
+        records.is_empty(),
+        "carved an OLE signature with no Root Entry: {:?}",
+        records
+            .iter()
+            .map(|r| (r.offset, r.size, r.ext))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_pdf_ends_where_its_own_startxref_says_it_does() {
+    // The last %%EOF in the window is usually the end, but not always: on a
+    // live scan one belonged to unrelated data further along and produced a
+    // 23 MB "PDF" whose cross-reference table sat at 1.8 MB.
+    let dir = Tmp::new("pdfend");
+    let mut pdf: Vec<u8> = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_at = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 1\ntrailer\n<< /Root 1 0 R >>\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    let real_end = pdf.len();
+
+    // Unrelated data further along that happens to contain %%EOF.
+    let mut blob = pdf.clone();
+    blob.extend_from_slice(&builders::Rng::new(5).bytes(40_000));
+    blob.extend_from_slice(b"trailing junk %%EOF\n");
+    blob.extend_from_slice(&[0u8; 512]);
+    let path = write_tmp(&dir, "pdf.dd", &blob);
+
+    let records = carve_all(&path, dir.join("out"), |o| o.dry_run = true);
+    let pdf_rec = records
+        .iter()
+        .find(|r| r.ext == "pdf")
+        .expect("the PDF was not carved");
+    assert_eq!(
+        pdf_rec.size, real_end as u64,
+        "carved to the wrong %%EOF: {} bytes instead of {real_end}",
+        pdf_rec.size
+    );
+    assert!(pdf_rec.validated);
+}

@@ -331,8 +331,37 @@ pub fn carve_pdf(w: &mut Window) -> Option<Carve> {
     // Bound the search at the next PDF header, if any, to avoid merging files.
     let horizon = w.find(b"%PDF-", 5, None);
     let end_limit = horizon.filter(|&h| h > 0).unwrap_or(w.limit);
-    let last = w.find_last(b"%%EOF", 0, Some(end_limit))?;
-    let mut end = last + 5;
+
+    // Every `%%EOF` in the window is a candidate end, newest first. The last one
+    // is usually right -- a PDF revised in place has several -- but not always:
+    // on a live scan the last one belonged to unrelated data further along and
+    // produced a 23 MB "PDF" whose cross-reference table sat at 1.8 MB. A real
+    // end is one the document agrees with, so each candidate is checked against
+    // the startxref that precedes it.
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut at = 0u64;
+    while let Some(found) = w.find(b"%%EOF", at, Some(end_limit)) {
+        candidates.push(found);
+        at = found + 5;
+        // Enough to cover a document's revision history without walking a
+        // window full of stray matches.
+        if candidates.len() >= 32 {
+            break;
+        }
+    }
+    let last = *candidates.last()?;
+    let consistent = candidates
+        .iter()
+        .rev()
+        .find(|&&eof| pdf_end_is_consistent(w, eof));
+    let (eof, validated) = match consistent {
+        Some(&eof) => (eof, true),
+        // Nothing self-consistent: keep the last one, but do not call it
+        // verified. A PDF whose middle was overwritten looks like this.
+        None => (last, false),
+    };
+
+    let mut end = eof + 5;
     // Take the single line terminator that ends the %%EOF line -- CRLF, or a
     // bare CR/LF. Consuming every EOL byte here also swallows trailing data
     // that merely happens to start with one.
@@ -342,7 +371,43 @@ pub fn carve_pdf(w: &mut Window) -> Option<Carve> {
     } else if !tail.is_empty() && (tail[0] == b'\r' || tail[0] == b'\n') {
         end += 1;
     }
-    carve(end, "pdf", true)
+    carve(end, "pdf", validated)
+}
+
+/// Does the `startxref` before this `%%EOF` point at something real?
+///
+/// The offset is from the start of the file, so on a correctly bounded carve it
+/// lands on the cross-reference table or on an object. If it points past the
+/// end, or at neither, this `%%EOF` is not this document's end -- or the
+/// document is damaged.
+fn pdf_end_is_consistent(w: &mut Window, eof: u64) -> bool {
+    // startxref, its offset, and the line endings all fit comfortably here.
+    let back = eof.min(64);
+    let tail = w.read(eof - back, back as usize);
+    let Some(at) = crate::window::find_sub(&tail, b"startxref") else {
+        return false;
+    };
+    let digits: Vec<u8> = tail[at + 9..]
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return false; // a NUL or nothing where the offset should be
+    }
+    let Ok(text) = std::str::from_utf8(&digits) else {
+        return false;
+    };
+    let Ok(off) = text.parse::<u64>() else {
+        return false;
+    };
+    if off == 0 || off >= eof {
+        return false;
+    }
+    let there = w.read(off, 24);
+    // Either the classic table, or a cross-reference stream object.
+    there.starts_with(b"xref") || crate::window::find_sub(&there, b"obj").is_some_and(|i| i <= 12)
 }
 
 // -------------------------------------------------------------------- RTF
@@ -482,6 +547,21 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
     let sector: u64 = 1 << shift;
     let per_sector = (sector / 4) as usize;
 
+    // Every OLE file's directory begins with an entry named "Root Entry". A
+    // D0CF11E0 signature without one is not the start of a file: it is an
+    // embedded object inside another document, or a coincidence. On a live scan
+    // four of fifteen carved OLE files were exactly that -- structurally
+    // plausible, and unopenable.
+    let dir_sect = u32le(&h, 48);
+    if dir_sect == FREESECT {
+        return None;
+    }
+    // "Root Entry" is ten UTF-16 code units: twenty bytes, then the NUL.
+    let root_name = w.read((dir_sect + 1) * sector, 20);
+    if root_name != utf16le("Root Entry") {
+        return None;
+    }
+
     let fallback = |w: &Window| carve(w.limit.min(8 << 20), "ole", false);
 
     // FAT sector locations: 109 header DIFAT entries, then the DIFAT chain.
@@ -547,13 +627,10 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
     // The root directory entry names the application outright; stream names are
     // the fallback for containers that leave the CLSID zeroed.
     let mut ext = "ole";
-    let dir_sect = u32le(&h, 48);
-    if dir_sect != FREESECT {
-        let root = w.read((dir_sect + 1) * sector, 128);
-        if root.len() == 128 {
-            if let Some((_, hint)) = OLE_CLSIDS.iter().find(|(id, _)| id[..] == root[80..96]) {
-                ext = hint;
-            }
+    let root = w.read((dir_sect + 1) * sector, 128);
+    if root.len() == 128 {
+        if let Some((_, hint)) = OLE_CLSIDS.iter().find(|(id, _)| id[..] == root[80..96]) {
+            ext = hint;
         }
     }
     if ext == "ole" {
