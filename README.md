@@ -586,6 +586,27 @@ One caveat worth knowing: if the source was not a whole number of sectors, some
 acquisition tools hash bytes they then do not store, which shows up here as a
 mismatch. Real disks are always sector multiples.
 
+## Knowing what a scan is doing
+
+A carve of a real disk runs for hours, so it says where it is:
+
+```
+  42.1 GiB of 100.5 GiB (41.9%) · 12.3 MiB/s · 1,204 file(s), 5.7 GiB · ETA 1h22m
+```
+
+Every few seconds, rewriting one line on a terminal and appending a line when
+piped to a log. `--machine` emits the same as JSON `progress` events, `-q`
+silences it, and a scan shorter than three seconds says nothing.
+
+Two things make that record durable rather than just decorative:
+
+- **`carved.jsonl`** beside the output gets one line per file as each range
+  completes, flushed. A manifest is only written when a scan *ends*; two killed
+  runs on a real examination left 165 GB of carved files with no record of what
+  any of them were.
+- **Ranges are checkpointed as each finishes**, not when the slowest of a batch
+  does. The same two runs had recorded nothing resumable after sixteen hours.
+
 ## Resuming an interrupted scan
 
 A scan of a few hundred gigabytes runs long enough that a power cut, a full

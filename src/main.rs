@@ -833,7 +833,7 @@ fn run() -> Result<ExitCode, String> {
                 ranges,
                 scan_end,
                 Some(&progress),
-                |_, _| {},
+                |_, _, _| {},
             ),
             None => run_parallel(&reader, &sigs, &opts),
         }
@@ -844,6 +844,10 @@ fn run() -> Result<ExitCode, String> {
             types: sigs.iter().map(|s| s.name).collect::<Vec<_>>().join(","),
         };
         let mut state = checkpoint::Checkpoint::open(&opts.out_dir, fingerprint, resume)?;
+        // Records are appended here as ranges finish. A manifest is only
+        // written when a scan ends, and two killed runs on a real examination
+        // left 165 GB of carved files with no record of what they were.
+        let mut stream = open_record_stream(&opts.out_dir, resume);
         let ranges = match &free {
             // Free-space ranges are already the work list; the checkpoint still
             // records which of them finished, so --resume works with it.
@@ -872,7 +876,10 @@ fn run() -> Result<ExitCode, String> {
                 &ranges,
                 scan_end,
                 Some(&progress),
-                |a, b| state.complete(a, b),
+                |a, b, recs| {
+                    stream_records(&mut stream, recs);
+                    state.complete(a, b);
+                },
             );
             stop_reporting.store(true, std::sync::atomic::Ordering::Relaxed);
             recs
@@ -2183,6 +2190,50 @@ fn format_duration(secs: u64) -> String {
         s if s < 5400 => format!("{}m", s / 60),
         s if s < 86_400 * 2 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
         s => format!("{}d{}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// Append-only record of what a scan has carved so far.
+///
+/// The manifest is written when a scan finishes, which is no help when one is
+/// killed: two interrupted runs on a real examination left 165 GB of carved
+/// files and no record of what any of them were. Each record is written here as
+/// its range completes, flushed, so the answer survives a kill -9.
+fn open_record_stream(out_dir: &str, resume: bool) -> Option<std::fs::File> {
+    use std::fs::OpenOptions;
+    let path = std::path::Path::new(out_dir).join("carved.jsonl");
+    std::fs::create_dir_all(out_dir).ok()?;
+    OpenOptions::new()
+        .create(true)
+        .append(resume)
+        .write(true)
+        .truncate(!resume)
+        .open(&path)
+        .ok()
+}
+
+fn stream_records(stream: &mut Option<std::fs::File>, records: &[Record]) {
+    use std::io::Write;
+    let Some(file) = stream.as_mut() else {
+        return;
+    };
+    let mut buf = String::new();
+    for r in records {
+        buf.push_str(&json::object(vec![
+            ("type", json::string(r.kind)),
+            ("ext", json::string(r.ext)),
+            ("offset", json::number(r.offset)),
+            ("size", json::number(r.size)),
+            ("sha256", json::string(&r.sha256)),
+            ("validated", json::boolean(r.validated)),
+            ("confidence", json::string(r.confidence())),
+            ("path", json::string(&r.path)),
+        ]));
+        buf.push('\n');
+    }
+    if !buf.is_empty() {
+        let _ = file.write_all(buf.as_bytes());
+        let _ = file.flush();
     }
 }
 

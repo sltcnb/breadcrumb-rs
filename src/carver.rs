@@ -572,7 +572,7 @@ pub fn run_ranges(
     ranges: &[(u64, u64)],
     scan_end: u64,
     progress: Option<&Progress>,
-    on_range_done: impl FnMut(u64, u64) + Send,
+    on_range_done: impl FnMut(u64, u64, &[Record]) + Send,
 ) -> Vec<Record> {
     let budget = OutputBudget::new(opts.max_output);
     // Ranges finish at different times, and one that finished should be
@@ -617,12 +617,17 @@ pub fn run_ranges(
                     if let Some(p) = progress {
                         c = c.with_progress(p);
                     }
-                    mine.extend(c.run());
+                    let recs = c.run();
                     if !budget.exhausted() {
+                        // The records go out with the range that produced them,
+                        // so a run that is killed still leaves a record of what
+                        // it found: a manifest written only at the end means a
+                        // killed scan leaves files nobody can account for.
                         if let Ok(mut f) = done.lock() {
-                            f(start, end);
+                            f(start, end, &recs);
                         }
                     }
+                    mine.extend(recs);
                 }
                 if let Ok(mut all) = collected.lock() {
                     all.extend(mine);

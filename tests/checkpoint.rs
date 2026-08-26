@@ -142,17 +142,76 @@ fn a_resumed_scan_finds_what_one_pass_finds() {
     let end = img.len() as u64;
     let mid = end / 2;
     let mut done: Vec<(u64, u64)> = Vec::new();
-    let mut first = run_ranges(&reader, &sigs, &opts, &[(0, mid)], end, None, |a, b| {
+    let mut first = run_ranges(&reader, &sigs, &opts, &[(0, mid)], end, None, |a, b, _| {
         done.push((a, b))
     });
-    let second = run_ranges(&reader, &sigs, &opts, &[(mid, end)], end, None, |a, b| {
-        done.push((a, b))
-    });
+    let second = run_ranges(
+        &reader,
+        &sigs,
+        &opts,
+        &[(mid, end)],
+        end,
+        None,
+        |a, b, _| done.push((a, b)),
+    );
     first.extend(second);
     assert_eq!(done, vec![(0, mid), (mid, end)]);
     assert_eq!(
         key(&one_pass),
         key(&first),
         "a resumed scan disagreed with a single pass"
+    );
+}
+
+#[test]
+fn a_killed_scan_still_leaves_a_record_of_what_it_found() {
+    // The manifest is written when a scan ends. Two killed runs on a real
+    // examination left 165 GB of carved files and no record of any of them, so
+    // records are streamed to carved.jsonl as each range completes.
+    let dir = Tmp::new("stream");
+    let png = builders::make_png();
+    let mut blob = vec![0u8; 4096];
+    for _ in 0..6 {
+        blob.extend_from_slice(&png);
+        blob.extend_from_slice(&builders::Rng::new(4).bytes(20_000));
+    }
+    let img = dir.join("disk.dd");
+    std::fs::write(&img, &blob).unwrap();
+    let out = dir.0.join("out");
+
+    let exe = env!("CARGO_BIN_EXE_bcrumb-rs");
+    let run = std::process::Command::new(exe)
+        .arg(&img)
+        .args(["-t", "png", "--no-dedup", "-q", "-o"])
+        .arg(&out)
+        .output()
+        .expect("failed to run");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stream = std::fs::read_to_string(out.join("carved.jsonl")).expect("no carved.jsonl");
+    let lines: Vec<&str> = stream.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "nothing was streamed");
+    // Every line stands on its own, so a file truncated mid-write still parses
+    // up to the last complete record.
+    for line in &lines {
+        let v = breadcrumb_rs::jsonin::parse(line).expect("a streamed line is not JSON");
+        assert!(v
+            .get("sha256")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s.len() == 64));
+        assert!(v.get("offset").and_then(|o| o.as_f64()).is_some());
+    }
+    // ...and it agrees with the manifest the finished run wrote.
+    let manifest = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    let doc = breadcrumb_rs::jsonin::parse(&manifest).unwrap();
+    let files = doc.get("files").and_then(|f| f.as_array()).unwrap();
+    assert_eq!(
+        files.len(),
+        lines.len(),
+        "the stream and the manifest disagree on how many files were carved"
     );
 }
