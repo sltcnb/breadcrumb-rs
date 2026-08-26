@@ -461,7 +461,12 @@ pub fn locate(src: &Source, offset: u64) -> Result<Container<'_>, String> {
     if let Ok(c) = Container::open(src, 0) {
         return Ok(c);
     }
-    for p in crate::partition::parse(src) {
+    // Largest first, so a small system partition never wins over the container
+    // that was meant.
+    let parts = crate::partition::parse(src);
+    let mut candidates: Vec<&crate::partition::Partition> = parts.iter().collect();
+    candidates.sort_by_key(|p| std::cmp::Reverse(p.size));
+    for p in candidates {
         if let Ok(c) = Container::open(src, p.start) {
             return Ok(c);
         }

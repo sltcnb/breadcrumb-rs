@@ -1989,13 +1989,25 @@ fn plan_unallocated(reader: &Source, opts: &Options) -> Result<Vec<(u64, u64)>, 
     let fs = match partition::detect_fs(reader, base) {
         "" if base == 0 => {
             // No filesystem at the start of the image: try the partitions.
-            let found = partition::parse(reader)
-                .into_iter()
-                .find(|p| matches!(p.fstype, "ntfs" | "fat" | "exfat" | "ext"));
-            match found {
-                Some(p) => {
+            let parts = partition::parse(reader);
+            match partition::largest_matching(&parts, |fs| {
+                matches!(fs, "ntfs" | "fat" | "exfat" | "ext")
+            }) {
+                Some((p, count)) => {
                     if !opts.quiet {
-                        eprintln!("unallocated: using {} at {:#x}", p.fstype, p.start);
+                        eprintln!(
+                            "unallocated: using the largest candidate, {} at {:#x} ({})",
+                            p.fstype,
+                            p.start,
+                            human(p.size)
+                        );
+                        if count > 1 {
+                            eprintln!(
+                                "unallocated: {} other volume(s) could have been meant -- \
+                                 pass --offset to choose",
+                                count - 1
+                            );
+                        }
                     }
                     return free_ranges_for(reader, p.fstype, p.start, MERGE_GAP, opts);
                 }
@@ -2145,10 +2157,21 @@ fn ntfs_base(reader: &Source, opts: &Options) -> Result<u64, String> {
         return Ok(opts.start);
     }
     let parts = breadcrumb_rs::partition::parse(reader);
-    match parts.iter().find(|p| p.fstype == "ntfs") {
-        Some(p) => {
+    match breadcrumb_rs::partition::largest_matching(&parts, |fs| fs == "ntfs") {
+        Some((p, count)) => {
             if !opts.quiet {
-                eprintln!("ntfs: volume at {:#x} ({})", p.start, p.name);
+                eprintln!(
+                    "ntfs: volume at {:#x} ({}, {})",
+                    p.start,
+                    p.name,
+                    human(p.size)
+                );
+                if count > 1 {
+                    eprintln!(
+                        "ntfs: {} other NTFS volume(s) here -- pass --offset to choose",
+                        count - 1
+                    );
+                }
             }
             Ok(p.start)
         }

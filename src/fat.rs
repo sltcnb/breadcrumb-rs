@@ -661,11 +661,17 @@ pub fn locate(src: &Source, offset: u64) -> Result<Volume<'_>, String> {
     if let Ok(v) = Volume::open(src, 0) {
         return Ok(v);
     }
-    for p in crate::partition::parse(src) {
-        if matches!(p.fstype, "fat" | "exfat") {
-            if let Ok(v) = Volume::open(src, p.start) {
-                return Ok(v);
-            }
+    // Largest first: the EFI system partition is FAT too, and on a Windows disk
+    // it sits before the volume anyone means.
+    let parts = crate::partition::parse(src);
+    let mut candidates: Vec<&crate::partition::Partition> = parts
+        .iter()
+        .filter(|p| matches!(p.fstype, "fat" | "exfat"))
+        .collect();
+    candidates.sort_by_key(|p| std::cmp::Reverse(p.size));
+    for p in candidates {
+        if let Ok(v) = Volume::open(src, p.start) {
+            return Ok(v);
         }
     }
     Err(

@@ -367,3 +367,18 @@ pub fn format_table(parts: &[Partition]) -> String {
     }
     lines.join("\n")
 }
+
+/// The partition most likely to be the one meant, among those whose filesystem
+/// `want` accepts: the largest.
+///
+/// Taking the first match instead picks the EFI system partition on any modern
+/// Windows disk -- 100 MB of FAT ahead of the 240 GB of NTFS that was wanted.
+/// A scan of it succeeds, finds almost nothing, and says nothing about why.
+pub fn largest_matching(
+    parts: &[Partition],
+    want: impl Fn(&str) -> bool,
+) -> Option<(&Partition, usize)> {
+    let matches: Vec<&Partition> = parts.iter().filter(|p| want(p.fstype)).collect();
+    let best = matches.iter().copied().max_by_key(|p| p.size)?;
+    Some((best, matches.len()))
+}
