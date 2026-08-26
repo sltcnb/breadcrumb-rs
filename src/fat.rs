@@ -754,3 +754,97 @@ pub fn recover(
     let cluster = vol.cluster_size;
     Ok((out, kind, cluster))
 }
+
+/// Where the free clusters are, from the FAT itself.
+///
+/// A FAT entry of zero means the cluster is free, so the allocation map and the
+/// chain map are the same structure. The table is read in blocks rather than an
+/// entry at a time: a 2 TB volume has hundreds of millions of entries, and one
+/// read each would cost more than the scan it is meant to save.
+pub fn free_ranges(
+    src: &Source,
+    offset: u64,
+    merge_gap: u64,
+) -> Result<crate::ntfs::FreeSpace, String> {
+    let vol = locate(src, offset)?;
+    if vol.cluster_count == 0 {
+        return Err("FAT volume reports no clusters".into());
+    }
+    let bits: u32 = match vol.kind {
+        Kind::Exfat => 32,
+        Kind::Fat { fat_type } => fat_type as u32,
+    };
+    let fat_base = match vol.kind {
+        Kind::Exfat => vol.base + vol.fat_offset * vol.bps,
+        Kind::Fat { .. } => vol.base + vol.reserved * vol.bps,
+    };
+    // Clusters are numbered from 2; entries 0 and 1 are reserved.
+    let last = vol.cluster_count + 1;
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut run_start: Option<u64> = None;
+    let block: u64 = 8 << 20;
+    let mut cluster = 2u64;
+    while cluster <= last {
+        // Where this cluster's entry sits, and how many entries the next block
+        // covers. FAT12 packs two entries into three bytes, so a block is read
+        // with a byte of overlap and the count is derived from the entry index.
+        let (at, span) = match bits {
+            16 => (fat_base + cluster * 2, block / 2),
+            32 => (fat_base + cluster * 4, block / 4),
+            _ => (fat_base + cluster + (cluster >> 1), block * 2 / 3),
+        };
+        let want = (block + 4) as usize;
+        let buf = vol.src.pread(at, want);
+        if buf.len() < 2 {
+            break;
+        }
+        let upto = (cluster + span).min(last);
+        for c in cluster..=upto {
+            let rel = match bits {
+                16 => ((c - cluster) * 2) as usize,
+                32 => ((c - cluster) * 4) as usize,
+                _ => ((c + (c >> 1)) - (cluster + (cluster >> 1))) as usize,
+            };
+            let free = match bits {
+                16 => u16le(&buf, rel) == 0,
+                32 => u32le(&buf, rel) & 0x0FFF_FFFF == 0,
+                _ => {
+                    let raw = u16le(&buf, rel);
+                    let v = if c & 1 == 1 { raw >> 4 } else { raw & 0x0FFF };
+                    v == 0
+                }
+            };
+            if rel + 2 > buf.len() {
+                break;
+            }
+            match (free, run_start) {
+                (true, None) => run_start = Some(c),
+                (false, Some(s)) => {
+                    runs.push((s - 2, c - s));
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        cluster = upto + 1;
+    }
+    if let Some(s) = run_start {
+        runs.push((s - 2, last + 1 - s));
+    }
+    // Cluster 2 starts the data region, so a run's byte offset is measured from
+    // there rather than from the start of the volume.
+    let data_start = vol.cluster_offset(2);
+    let volume_end = vol.base.saturating_add(vol.volume_size);
+    let (ranges, free_bytes) = crate::ntfs::ranges_from_free_clusters(
+        runs.into_iter(),
+        data_start,
+        vol.cluster_size,
+        volume_end,
+        merge_gap,
+    );
+    Ok(crate::ntfs::FreeSpace {
+        ranges,
+        free_bytes,
+        volume_bytes: vol.volume_size,
+    })
+}

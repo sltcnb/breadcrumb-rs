@@ -117,6 +117,10 @@ pub struct Volume<'a> {
     has_extents: bool,
     /// Inode table block, per group.
     tables: Vec<u64>,
+    /// Block bitmap block, per group.
+    bitmaps: Vec<u64>,
+    blocks_per_group: u64,
+    first_data_block: u64,
 }
 
 impl<'a> Volume<'a> {
@@ -165,6 +169,7 @@ impl<'a> Volume<'a> {
             (groups.saturating_mul(desc_size)).min(64 << 20) as usize,
         );
         let mut tables = Vec::with_capacity(groups as usize);
+        let mut bitmaps = Vec::with_capacity(groups as usize);
         for g in 0..groups {
             let at = (g * desc_size) as usize;
             if at + 32 > raw.len() {
@@ -174,6 +179,10 @@ impl<'a> Volume<'a> {
             let lo = u32le(d, 8);
             let hi = if desc_size >= 0x2C { u32le(d, 0x28) } else { 0 };
             tables.push(lo | (hi << 32));
+            // bg_block_bitmap is the first field of the descriptor.
+            let blo = u32le(d, 0);
+            let bhi = if desc_size >= 0x24 { u32le(d, 0x20) } else { 0 };
+            bitmaps.push(blo | (bhi << 32));
         }
         if tables.is_empty() {
             return Err("ext group descriptors unreadable".into());
@@ -192,6 +201,9 @@ impl<'a> Volume<'a> {
             },
             has_extents: feature_incompat & INCOMPAT_EXTENTS != 0,
             tables,
+            bitmaps,
+            blocks_per_group,
+            first_data_block,
         })
     }
 
@@ -652,4 +664,68 @@ pub fn recover(
         map_gone,
     };
     Ok((out, summary))
+}
+
+/// Where the free blocks are, from the per-group block bitmaps.
+///
+/// Each group descriptor points at a bitmap of one bit per block in that group,
+/// set when the block is in use. Carving only the clear ones skips every
+/// allocated file.
+pub fn free_ranges(
+    src: &Source,
+    offset: u64,
+    merge_gap: u64,
+) -> Result<crate::ntfs::FreeSpace, String> {
+    let vol = locate(src, offset)?;
+    if vol.bitmaps.is_empty() || vol.blocks_per_group == 0 {
+        return Err("ext volume has no block bitmaps".into());
+    }
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut run_start: Option<u64> = None;
+    for (g, &bitmap_block) in vol.bitmaps.iter().enumerate() {
+        let first_block = vol.first_data_block + g as u64 * vol.blocks_per_group;
+        let in_group = vol
+            .blocks_per_group
+            .min(vol.blocks_count.saturating_sub(first_block));
+        if in_group == 0 {
+            break;
+        }
+        let bitmap = vol.block(bitmap_block);
+        if bitmap.is_empty() {
+            // An unreadable bitmap must not be read as "all free": treat the
+            // whole group as allocated and say nothing about it.
+            if let Some(s) = run_start.take() {
+                runs.push((s, first_block - s));
+            }
+            continue;
+        }
+        for b in 0..in_group.min(bitmap.len() as u64 * 8) {
+            let block_no = first_block + b;
+            let in_use = bitmap[(b / 8) as usize] & (1 << (b % 8)) != 0;
+            match (in_use, run_start) {
+                (false, None) => run_start = Some(block_no),
+                (true, Some(s)) => {
+                    runs.push((s, block_no - s));
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(s) = run_start {
+        runs.push((s, vol.blocks_count.saturating_sub(s)));
+    }
+    let volume_bytes = vol.blocks_count.saturating_mul(vol.block_size);
+    let (ranges, free_bytes) = crate::ntfs::ranges_from_free_clusters(
+        runs.into_iter(),
+        vol.base,
+        vol.block_size,
+        vol.base.saturating_add(volume_bytes),
+        merge_gap,
+    );
+    Ok(crate::ntfs::FreeSpace {
+        ranges,
+        free_bytes,
+        volume_bytes,
+    })
 }

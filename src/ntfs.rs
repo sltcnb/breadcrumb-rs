@@ -757,3 +757,115 @@ pub fn deletion_events(
         sources: tally,
     })
 }
+
+/// The unallocated regions of a volume, as absolute byte ranges.
+pub struct FreeSpace {
+    pub ranges: Vec<(u64, u64)>,
+    pub free_bytes: u64,
+    pub volume_bytes: u64,
+}
+
+impl FreeSpace {
+    pub fn fraction(&self) -> f64 {
+        if self.volume_bytes == 0 {
+            0.0
+        } else {
+            self.free_bytes as f64 / self.volume_bytes as f64
+        }
+    }
+}
+
+/// Turn a run of free cluster numbers into coalesced byte ranges.
+///
+/// Runs separated by less than `merge_gap` are joined: reading a little
+/// allocated data costs less than the seek and the per-range overhead of
+/// avoiding it, and it keeps the range count sane on a fragmented volume.
+pub(crate) fn ranges_from_free_clusters(
+    free: impl Iterator<Item = (u64, u64)>,
+    base: u64,
+    cluster: u64,
+    volume_end: u64,
+    merge_gap: u64,
+) -> (Vec<(u64, u64)>, u64) {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut free_bytes = 0u64;
+    for (first, count) in free {
+        let start = base.saturating_add(first.saturating_mul(cluster));
+        let end = start
+            .saturating_add(count.saturating_mul(cluster))
+            .min(volume_end);
+        if end <= start {
+            continue;
+        }
+        free_bytes += end - start;
+        match ranges.last_mut() {
+            Some(last) if start.saturating_sub(last.1) <= merge_gap => last.1 = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+    (ranges, free_bytes)
+}
+
+/// Where the free clusters are, from `$Bitmap`.
+///
+/// `$Bitmap` is MFT record 6 and holds one bit per cluster, least significant
+/// bit first, set when the cluster is in use. Carving only the clear ones skips
+/// every allocated file -- which is both the bulk of a full disk and the source
+/// of most spurious carves, since a stray header inside an allocated archive or
+/// installer is what produces them.
+pub fn free_ranges(src: &Source, base: u64, merge_gap: u64) -> Result<FreeSpace, String> {
+    let vol = Volume::open(src, base)?;
+    let info = parse_record(&vol, 6).ok_or("NTFS $Bitmap (record 6) is unreadable")?;
+    let stream = info
+        .data
+        .iter()
+        .find(|s| s.name.is_empty())
+        .ok_or("NTFS $Bitmap has no unnamed $DATA")?;
+    let bitmap = if stream.resident {
+        stream.content.clone()
+    } else {
+        let runs = stream
+            .runs
+            .as_deref()
+            .ok_or("NTFS $Bitmap is non-resident with no runlist")?;
+        vol.read_runs(runs, stream.real_size)
+    };
+    if bitmap.is_empty() {
+        return Err("NTFS $Bitmap is empty".into());
+    }
+    let clusters = if vol.cluster == 0 {
+        0
+    } else {
+        vol.volume_size / vol.cluster
+    };
+    if clusters == 0 {
+        return Err("NTFS volume has no clusters".into());
+    }
+    // Bits past the end of the volume are not clusters, whatever they say.
+    let counted = clusters.min(bitmap.len() as u64 * 8);
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut run_start: Option<u64> = None;
+    for c in 0..counted {
+        let byte = bitmap[(c / 8) as usize];
+        let in_use = byte & (1 << (c % 8)) != 0;
+        match (in_use, run_start) {
+            (false, None) => run_start = Some(c),
+            (true, Some(s)) => {
+                runs.push((s, c - s));
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = run_start {
+        runs.push((s, counted - s));
+    }
+    let volume_end = base.saturating_add(vol.volume_size);
+    let (ranges, free_bytes) =
+        ranges_from_free_clusters(runs.into_iter(), base, vol.cluster, volume_end, merge_gap);
+    Ok(FreeSpace {
+        ranges,
+        free_bytes,
+        volume_bytes: vol.volume_size,
+    })
+}

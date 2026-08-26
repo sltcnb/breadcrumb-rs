@@ -61,6 +61,13 @@ options:
                           objects, which is where deleted files survive
       --auto              find every partition and run the undelete mode its
                           filesystem calls for, one volume at a time
+      --list-free         print the free-space map (how much, in how many runs)
+                          and exit, without scanning anything
+      --unallocated       carve only the free space, read from the filesystem's
+                          own allocation map (NTFS $Bitmap, the FAT, ext block
+                          bitmaps). Skips every allocated file, which is both
+                          the bulk of a full disk and where most spurious
+                          carves come from
       --include-live      with an undelete mode, also recover files in use
       --deleted-times     when files were deleted, from $Recycle.Bin/$I records
                           and the $UsnJrnl change journal (writes deletions.csv)
@@ -131,6 +138,10 @@ by scenario
     bcrumb-rs disk.E01 --list-partitions
   inventory first: how much would a full carve write?
     bcrumb-rs disk.E01 --dry-run -t office
+  how much of the disk is even worth scanning?
+    bcrumb-rs disk.E01 --list-free
+  skip everything still allocated: usually the biggest win there is
+    bcrumb-rs disk.E01 -t office -o out --unallocated
   a big disk, all cores, output somewhere with room
     bcrumb-rs disk.E01 -j 0 -o /mnt/scratch/out
   find a keyword, in ASCII and UTF-16LE
@@ -336,6 +347,8 @@ fn run() -> Result<ExitCode, String> {
     let mut hfs_mode = false;
     let mut apfs_mode = false;
     let mut auto_mode = false;
+    let mut unallocated = false;
+    let mut list_free = false;
     let mut include_live = false;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
@@ -420,6 +433,11 @@ fn run() -> Result<ExitCode, String> {
             "--hfs" | "--hfsplus" => hfs_mode = true,
             "--apfs" => apfs_mode = true,
             "--auto" => auto_mode = true,
+            "--unallocated" | "--free-space" => unallocated = true,
+            "--list-free" => {
+                list_free = true;
+                unallocated = true;
+            }
             "--include-live" => include_live = true,
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
@@ -695,6 +713,53 @@ fn run() -> Result<ExitCode, String> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    let free = if unallocated {
+        let ranges = plan_unallocated(&reader, &opts)?;
+        if list_free {
+            let total: u64 = ranges.iter().map(|&(a, b)| b - a).sum();
+            let largest = ranges.iter().map(|&(a, b)| b - a).max().unwrap_or(0);
+            if machine {
+                println!(
+                    "{}",
+                    json::object(vec![
+                        ("event", json::string("free_space")),
+                        ("ranges", json::number(ranges.len() as u64)),
+                        ("free_bytes", json::number(total)),
+                        ("largest_run", json::number(largest)),
+                    ])
+                );
+                for (a, b) in &ranges {
+                    println!(
+                        "{}",
+                        json::object(vec![
+                            ("event", json::string("free_range")),
+                            ("start", json::number(*a)),
+                            ("end", json::number(*b)),
+                        ])
+                    );
+                }
+            } else {
+                println!(
+                    "{} to scan in {} run(s); largest {}",
+                    human(total),
+                    ranges.len(),
+                    human(largest)
+                );
+                println!("{:>16}  {:>16}  {:>12}", "start", "end", "size");
+                for (a, b) in ranges.iter().take(40) {
+                    println!("{a:>16}  {b:>16}  {:>12}", human(b - a));
+                }
+                if ranges.len() > 40 {
+                    println!("... {} more run(s)", ranges.len() - 40);
+                }
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(ranges)
+    } else {
+        None
+    };
+
     if !opts.quiet {
         eprintln!(
             "scanning {}{} ({:.1} MiB) for {} type(s), {} thread(s)",
@@ -746,8 +811,15 @@ fn run() -> Result<ExitCode, String> {
     } else {
         reader.size()
     };
+    // Only the free space, if asked: the filesystem's allocation map says where
+    // that is, and the range scanner below already carves a file that starts in
+    // a range and continues past its end.
+
     let records = if opts.dry_run {
-        run_parallel(&reader, &sigs, &opts)
+        match &free {
+            Some(ranges) => run_ranges(&reader, &sigs, &opts, ranges, scan_end, |_, _| {}),
+            None => run_parallel(&reader, &sigs, &opts),
+        }
     } else {
         let fingerprint = checkpoint::Fingerprint {
             source: reader.path().to_string(),
@@ -755,7 +827,15 @@ fn run() -> Result<ExitCode, String> {
             types: sigs.iter().map(|s| s.name).collect::<Vec<_>>().join(","),
         };
         let mut state = checkpoint::Checkpoint::open(&opts.out_dir, fingerprint, resume)?;
-        let ranges = plan_ranges(&state, opts.start, scan_end, opts.chunk_size, opts.jobs);
+        let ranges = match &free {
+            // Free-space ranges are already the work list; the checkpoint still
+            // records which of them finished, so --resume works with it.
+            Some(free) => free
+                .iter()
+                .flat_map(|&(a, b)| state.remaining(a, b))
+                .collect::<Vec<_>>(),
+            None => plan_ranges(&state, opts.start, scan_end, opts.chunk_size, opts.jobs),
+        };
         if resume && state.bytes_done() > 0 && !opts.quiet {
             eprintln!(
                 "resuming: {} of {} already scanned, {} range(s) left",
@@ -1876,6 +1956,88 @@ fn recover_one(
         other => return Err(format!("no undelete mode for {other}")),
     }
     Ok(())
+}
+
+/// The volume's unallocated ranges, from its own allocation map.
+///
+/// This is the cheapest large win available on a full disk: the map costs one
+/// small read (a 238 GB NTFS volume's $Bitmap is about 7 MiB) and everything
+/// still allocated is then skipped. It also removes the main source of spurious
+/// carves, since a stray header inside an allocated archive or installer is what
+/// produces most of them.
+fn plan_unallocated(reader: &Source, opts: &Options) -> Result<Vec<(u64, u64)>, String> {
+    use breadcrumb_rs::partition;
+
+    // Adjacent free runs closer than this are merged: reading a little
+    // allocated data costs less than the seek and the per-range overhead of
+    // avoiding it. Small enough not to swallow whole allocated files, large
+    // enough that a fragmented volume does not become one range per cluster.
+    const MERGE_GAP: u64 = 64 << 10;
+
+    let base = opts.start;
+    let fs = match partition::detect_fs(reader, base) {
+        "" if base == 0 => {
+            // No filesystem at the start of the image: try the partitions.
+            let found = partition::parse(reader)
+                .into_iter()
+                .find(|p| matches!(p.fstype, "ntfs" | "fat" | "exfat" | "ext"));
+            match found {
+                Some(p) => {
+                    if !opts.quiet {
+                        eprintln!("unallocated: using {} at {:#x}", p.fstype, p.start);
+                    }
+                    return free_ranges_for(reader, p.fstype, p.start, MERGE_GAP, opts);
+                }
+                None => return Err(unallocated_unsupported("no filesystem found")),
+            }
+        }
+        other => other,
+    };
+    free_ranges_for(reader, fs, base, MERGE_GAP, opts)
+}
+
+fn free_ranges_for(
+    reader: &Source,
+    fs: &str,
+    base: u64,
+    merge_gap: u64,
+    opts: &Options,
+) -> Result<Vec<(u64, u64)>, String> {
+    let space = match fs {
+        "ntfs" => breadcrumb_rs::ntfs::free_ranges(reader, base, merge_gap),
+        "fat" | "exfat" => breadcrumb_rs::fat::free_ranges(reader, base, merge_gap),
+        "ext" => breadcrumb_rs::ext4::free_ranges(reader, base, merge_gap),
+        other => return Err(unallocated_unsupported(other)),
+    }?;
+    if space.ranges.is_empty() {
+        return Err(
+            "the allocation map reports no free space at all -- refusing \
+                    rather than scanning nothing"
+                .into(),
+        );
+    }
+    if !opts.quiet {
+        let to_scan: u64 = space.ranges.iter().map(|&(a, b)| b - a).sum();
+        eprintln!(
+            "unallocated: {} free of {} ({:.0}%); scanning {} in {} run(s) after \
+             coalescing, skipping {}",
+            human(space.free_bytes),
+            human(space.volume_bytes),
+            space.fraction() * 100.0,
+            human(to_scan),
+            space.ranges.len(),
+            human(space.volume_bytes.saturating_sub(to_scan))
+        );
+    }
+    Ok(space.ranges)
+}
+
+fn unallocated_unsupported(fs: &str) -> String {
+    format!(
+        "--unallocated needs an allocation map, and {fs} is not one this reads \
+         (NTFS, FAT/exFAT and ext are). Scan the whole volume instead, or point \
+         --offset at a volume that is."
+    )
 }
 
 /// Deletion times, which carving and the MFT alone cannot give.

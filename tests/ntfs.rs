@@ -124,3 +124,57 @@ fn a_volume_without_ntfs_is_refused() {
 }
 
 use sha2::Digest;
+
+/// The clusters the fixture's builder actually used, recorded by the builder
+/// itself when it laid the volume out -- not by anything that reads it.
+fn layout() -> (u64, u64, Vec<u64>) {
+    let text = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ntfs_deleted.layout.json"),
+    )
+    .expect("layout record missing");
+    let doc = breadcrumb_rs::jsonin::parse(&text).expect("layout is not JSON");
+    let num = |k: &str| doc.get(k).and_then(|v| v.as_f64()).unwrap() as u64;
+    let used = doc
+        .get("used_clusters")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as u64)
+        .collect();
+    (num("cluster_size"), num("total_clusters"), used)
+}
+
+#[test]
+fn free_space_is_exactly_the_complement_of_what_is_allocated() {
+    // $Bitmap is one bit per cluster, set when in use. Getting the bit order or
+    // the sense backwards would still produce plausible-looking ranges, so this
+    // compares against the set of clusters the builder allocated -- which it
+    // knew before writing the bitmap, and which nothing in this crate computed.
+    let (cluster_size, total, used) = layout();
+    let src = Source::open(fixture().to_str().unwrap()).unwrap();
+    // merge_gap 0: no coalescing, so the ranges map one-to-one onto free runs.
+    let space = ntfs::free_ranges(&src, 0, 0).expect("free_ranges failed");
+
+    let mut want: Vec<u64> = (0..total).filter(|c| !used.contains(c)).collect();
+    want.sort_unstable();
+    assert_eq!(
+        space.free_bytes,
+        want.len() as u64 * cluster_size,
+        "free byte count disagrees with the layout"
+    );
+
+    // Every free cluster must fall inside a reported range, and no allocated
+    // one may.
+    let covered = |c: u64| {
+        let at = c * cluster_size;
+        space.ranges.iter().any(|&(a, b)| at >= a && at < b)
+    };
+    for c in &want {
+        assert!(covered(*c), "free cluster {c} is not in any range");
+    }
+    for c in &used {
+        assert!(!covered(*c), "allocated cluster {c} was reported as free");
+    }
+    assert_eq!(space.volume_bytes, total * cluster_size);
+}

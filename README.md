@@ -313,6 +313,36 @@ started on.
 An empty result is reported as one, not as an absence of evidence: the recycle
 bin may simply be empty, and the journal can be disabled or wiped.
 
+## Carve only the free space
+
+```sh
+bcrumb-rs disk.E01 --list-free                        # how much is worth scanning?
+bcrumb-rs disk.E01 -t office -o out --unallocated     # scan only that
+```
+
+The filesystem already knows which clusters nothing owns, so `--unallocated`
+asks it: NTFS `$Bitmap`, the FAT itself, ext's per-group block bitmaps. Reading
+the map is one small read — a 238 GB NTFS volume's bitmap is about 7 MiB — and
+everything still allocated is then skipped.
+
+Two things follow, and the second is easy to miss:
+
+- **Time.** The saving is whatever fraction of the volume is in use. On a disk
+  that is 70% full, that is 70% of the scan.
+- **Noise.** Most spurious carves come from *allocated* data — a stray header
+  inside an installer payload or a nested archive. Skipping allocated space
+  removes them at the source, and the files that were still allocated are
+  recoverable by reading the filesystem anyway (`--ntfs`, `--fat`, `--ext4`).
+
+A file that starts in free space and runs past the end of a free run is still
+carved whole: the run bounds where headers are *looked for*, not how far a carve
+may read. Free runs closer together than 64 KiB are coalesced, so a fragmented
+volume does not turn into one range per cluster; the reported numbers say both
+what is free and what will actually be read.
+
+HFS+ and APFS are not covered — their maps are not read yet — and the tool says
+so rather than silently scanning everything.
+
 ## ZIP fragments are not archives
 
 A carved ZIP-family file (`zip`, `docx`, `xlsx`, `pptx`, `jar`, …) must have a
