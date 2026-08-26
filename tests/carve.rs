@@ -464,9 +464,13 @@ fn pst_size_comes_from_the_header() {
 }
 
 #[test]
-fn zip_carve_stays_inside_the_archive() {
-    // A fragmented archive must not be extended to a *different* archive's
-    // end-of-central-directory, swallowing everything in between.
+fn a_zip_fragment_without_a_central_directory_is_not_carved() {
+    // What made this the default: a scan of a 238 GB Windows disk wrote 3192
+    // files of exactly 16 MiB -- the unresolved cap, hit dead on -- for 49.9 GB,
+    // 74% of everything it produced, and most were "not a zip file" when
+    // tested. A window opening part-way inside a real archive walks genuine
+    // member headers and never reaches that archive's directory. Without a
+    // directory these bytes are a fragment of an archive, not an archive.
     let dir = Tmp::new("zipfrag");
     let whole = builders::zip_with(b"word/document.xml", &b"content ".repeat(200));
     let mut blob = whole[..whole.len() / 2].to_vec(); // first fragment only
@@ -476,13 +480,45 @@ fn zip_carve_stays_inside_the_archive() {
     let path = write_tmp(&dir, "frag.img", &blob);
 
     let records = carve_all(&path, dir.join("out"), |o| o.skip_carved = false);
+    assert!(
+        !records.iter().any(|r| r.offset == 0),
+        "a directory-less fragment was carved: {:?}",
+        records
+            .iter()
+            .map(|r| (r.offset, r.size))
+            .collect::<Vec<_>>()
+    );
+    // The intact archive further along is unaffected.
+    let intact = records
+        .iter()
+        .find(|r| r.offset == tail_start as u64)
+        .expect("intact archive missed");
+    assert_eq!(intact.size, whole.len() as u64);
+    assert!(intact.validated);
+}
+
+#[test]
+fn zip_partial_brings_fragments_back_without_over_carving() {
+    // An examination that wants the fragments can have them, and the protection
+    // that matters still holds: a fragment must never be extended to a
+    // *different* archive's end-of-central-directory, swallowing everything in
+    // between, which is what hunting for a trailing EOCD used to do.
+    let dir = Tmp::new("zippartial");
+    let whole = builders::zip_with(b"word/document.xml", &b"content ".repeat(200));
+    let mut blob = whole[..whole.len() / 2].to_vec();
+    blob.extend_from_slice(&builders::Rng::new(8).bytes(60_000));
+    let tail_start = blob.len();
+    blob.extend_from_slice(&whole);
+    let path = write_tmp(&dir, "frag.img", &blob);
+
+    handlers::set_zip_partial(true);
+    let records = carve_all(&path, dir.join("out"), |o| o.skip_carved = false);
+    handlers::set_zip_partial(false);
+
     let first = records
         .iter()
         .find(|r| r.offset == 0)
-        .expect("no carve at 0");
-    // The walk trusts each member's declared size, so a truncated fragment can
-    // overshoot by the bytes that are missing -- but it must never run on to
-    // the next archive, which is what searching for a trailing EOCD used to do.
+        .expect("--zip-partial did not bring the fragment back");
     assert!(
         first.size <= whole.len() as u64,
         "fragment over-carved to {} bytes, past one archive's worth",
@@ -496,12 +532,6 @@ fn zip_carve_stays_inside_the_archive() {
         !first.validated,
         "a fragment must not be reported as validated"
     );
-    let intact = records
-        .iter()
-        .find(|r| r.offset == tail_start as u64)
-        .expect("intact archive missed");
-    assert_eq!(intact.size, whole.len() as u64);
-    assert!(intact.validated);
 }
 
 #[test]
@@ -656,7 +686,17 @@ fn an_unresolvable_zip_carve_is_bounded() {
     blob.extend_from_slice(&builders::Rng::new(77).bytes(40 << 20));
     let path = write_tmp(&dir, "stray.bin", &blob);
 
+    // By default there is no carve at all: no central directory, no archive.
     let records = carve_all(&path, dir.join("out"), |o| o.dry_run = true);
+    assert!(
+        !records.iter().any(|r| r.offset == 0),
+        "a stray PK header produced a carve"
+    );
+
+    // With --zip-partial the cap is what stops it, and it must hold.
+    handlers::set_zip_partial(true);
+    let records = carve_all(&path, dir.join("out"), |o| o.dry_run = true);
+    handlers::set_zip_partial(false);
     for r in records.iter().filter(|r| r.offset == 0) {
         assert!(r.size <= 16 << 20, "unresolved zip carved {} bytes", r.size);
         assert!(!r.validated);

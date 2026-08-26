@@ -313,6 +313,34 @@ started on.
 An empty result is reported as one, not as an absence of evidence: the recycle
 bin may simply be empty, and the journal can be disabled or wiped.
 
+## ZIP fragments are not archives
+
+A carved ZIP-family file (`zip`, `docx`, `xlsx`, `pptx`, `jar`, …) must have a
+central directory of its own. Without one it is not written.
+
+That default came from a measurement, not a preference. A scan of a 238 GB
+Windows disk for `-t office` produced 67.6 GB, of which **3192 files were exactly
+16 MiB — 49.9 GB, 74% of everything written**. That size is the tool's own cap
+for an archive whose end it cannot resolve, hit dead on. Sampling them found
+`not a zip file` far more often than not; the genuine finds were the other
+quarter (2.1 GB of PDF, ~1 GB xlsx, 727 MB pptx, 704 MB docx, and real archives
+including one holding a `.doc`).
+
+The cause is ordinary on a Windows disk: a window that opens part-way inside a
+real archive — an installer payload, a nested zip — walks genuine member headers,
+never reaches that archive's directory, and gets clamped at the cap. The bytes
+are a fragment of an archive rather than an archive.
+
+```sh
+bcrumb-rs disk.E01 -t office -o out                  # fragments are skipped
+bcrumb-rs disk.E01 -t office -o out --zip-partial    # ...and kept, unvalidated
+```
+
+An archive that lost only its final record still comes back: a parsed central
+directory is enough, and it is reported unvalidated. On a synthetic image of the
+failing shape, the default writes nothing where the old behaviour wrote 36 MB
+from a 3.8 MB image.
+
 ## Is the carved file intact?
 
 A handler agrees the structure is well formed. That is not the same as the file

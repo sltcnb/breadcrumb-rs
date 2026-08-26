@@ -40,6 +40,10 @@ options:
   -E, --regex             treat --grep patterns as regular expressions (matched
                           against the bytes; literals also match UTF-16LE)
       --max-hits N        stop after N --grep hits
+      --zip-partial       also keep ZIP-family fragments that have no central
+                          directory of their own. Off by default: on a 238 GB
+                          disk they were 74% of everything written and mostly
+                          were not archives
       --validate          decode each carved file to confirm it is intact, not
                           only well formed (PNG/ZIP+OOXML/gzip CRCs, JPEG and
                           SQLite structure); reported as verified/failed
@@ -404,6 +408,7 @@ fn run() -> Result<ExitCode, String> {
             "--sig-file" => sig_file = Some(next(&mut i)?),
             "--only-custom" => only_custom = true,
             "--from-manifest" => from_manifest = Some(next(&mut i)?),
+            "--zip-partial" => breadcrumb_rs::handlers::set_zip_partial(true),
             "--validate" => opts.validate = true,
             "--drop-failed" => {
                 opts.validate = true;

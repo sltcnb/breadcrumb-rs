@@ -592,6 +592,30 @@ const ZIP_MEMBER_SANITY: u64 = 64 << 20;
 /// Cap on a carve that never resolved a central directory.
 const ZIP_UNRESOLVED_CAP: u64 = 16 << 20;
 
+/// Whether to keep a ZIP-family carve that has no central directory of its own.
+///
+/// Off by default, and that default was learned the hard way. A scan of a 238 GB
+/// Windows disk wrote 3192 files of exactly 16 MiB -- this cap, hit dead on --
+/// totalling 49.9 GB, which was 74% of everything it produced. They were not
+/// archives: a window opening part-way inside a real archive (an installer
+/// payload, a nested zip) walks genuine member headers, never reaches that
+/// archive's directory, and gets clamped here. Sampling them found "not a zip
+/// file" far more often than not.
+///
+/// A central directory is what makes a run of bytes an archive rather than a
+/// fragment of one, so without it there is nothing to carve. `--zip-partial`
+/// brings the old behaviour back for an examination that wants the fragments.
+static ZIP_PARTIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep ZIP fragments that have no central directory (`--zip-partial`).
+pub fn set_zip_partial(on: bool) {
+    ZIP_PARTIAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn zip_partial() -> bool {
+    ZIP_PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn zip_walk_members(w: &mut Window) -> (u64, bool) {
     let mut pos: u64 = 0;
     loop {
@@ -641,7 +665,9 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
     // *next* archive's directory when this one is truncated or fragmented, and
     // carves everything in between.
     let (mut accounted, intact) = zip_walk_members(w);
+    let mut saw_directory = false;
     if intact && accounted > 0 && w.read(accounted, 4) == b"PK\x01\x02" {
+        saw_directory = true;
         let mut pos = accounted;
         while w.read(pos, 4) == b"PK\x01\x02" {
             let ent = w.read(pos, 46);
@@ -674,7 +700,9 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
                 }
             }
         }
-        // Directory parsed but no EOCD behind it: keep what is accounted for.
+        // Directory parsed but no EOCD behind it: an archive whose last record
+        // was lost. Keep what is accounted for -- the directory itself is the
+        // evidence that this is an archive.
         accounted = accounted.max(pos).min(w.limit);
     }
 
@@ -695,10 +723,13 @@ pub fn carve_zip(w: &mut Window) -> Option<Carve> {
         search = eocd + 1;
     }
 
-    // Nothing conclusive: carve the bytes accounted for, bounded and flagged
-    // unvalidated. The useful data is at the front; without a central directory
-    // there is nothing to say where the archive ends, so an unbounded walk just
-    // ships unrelated disk.
+    // No EOCD. If a central directory was parsed, this is an archive that lost
+    // its last record and is worth keeping, unvalidated. If there was no
+    // directory either, these bytes are a fragment of some archive rather than
+    // an archive -- see ZIP_PARTIAL for what that cost on real evidence.
+    if !saw_directory && !zip_partial() {
+        return None;
+    }
     let accounted = accounted.min(w.limit).min(ZIP_UNRESOLVED_CAP);
     if accounted == 0 {
         return None;
