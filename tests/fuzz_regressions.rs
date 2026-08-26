@@ -34,7 +34,14 @@ fn known_crashing_inputs_are_still_handled() {
             entry.file_name().to_string_lossy()
         ));
         std::fs::write(&tmp, &data[1..]).unwrap();
-        let src = Source::open(tmp.to_str().unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let Ok(src) = Source::open(tmp.to_str().unwrap()) else {
+            // Refusing the file outright is a perfectly good outcome: one of
+            // these inputs is a QCOW2 header claiming sixteen exabytes.
+            let _ = std::fs::remove_file(&tmp);
+            count += 1;
+            continue;
+        };
         let limit = src.size();
         let mut w = Window::new(&src, 0, limit);
         if let Some(carve) = sig.carve(&mut w) {
@@ -47,6 +54,12 @@ fn known_crashing_inputs_are_still_handled() {
                 limit
             );
         }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{}: took {:?}",
+            entry.file_name().to_string_lossy(),
+            started.elapsed()
+        );
         let _ = std::fs::remove_file(&tmp);
         count += 1;
     }

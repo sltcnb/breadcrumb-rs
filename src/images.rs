@@ -193,6 +193,22 @@ impl Qcow2Reader {
         if l1_size > 1 << 26 {
             return Err(err("implausible QCOW2 L1 table size"));
         }
+        // The declared virtual size is a header field too, and a sparse image
+        // legitimately declares far more than its file holds -- but not more
+        // than its own L1 table can address. A header claiming 16 exabytes for
+        // a 149-byte file had the carver searching a 1.6e19-byte window, which
+        // is a hang with no output: cargo-fuzz found exactly that.
+        let addressable = (l1_size as u64)
+            .checked_mul(cluster_size / 8)
+            .and_then(|clusters| clusters.checked_mul(cluster_size))
+            .ok_or_else(|| err("implausible QCOW2 geometry"))?;
+        if size == 0 || size > addressable {
+            return Err(err(format!(
+                "QCOW2 header declares {size} bytes, but its L1 table can address \
+                 only {addressable} -- refusing rather than reading a window that \
+                 is not there"
+            )));
+        }
         let raw = read_at(&file, l1_offset, (l1_size * 8) as usize);
         let l1 = (0..l1_size as usize).map(|i| u64be(&raw, i * 8)).collect();
         Ok(Qcow2Reader {

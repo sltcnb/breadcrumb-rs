@@ -499,11 +499,13 @@ its window is rejected, so one arithmetic slip in one of 28 parsers cannot write
 unrelated disk into evidence. The first run of the mutation fuzz found exactly
 that — a corrupted PNG chunk length yielding 16 KB from an 80-byte window.
 
-Fuzzing has paid for itself three times so far: that PNG over-read, an overflow
-in the VMDK grain-table geometry, and a 185-byte EWF file whose section chain
-pointed in a cycle — the parser followed it for half an hour before the campaign
-timed out. Sections must now move forward, and every one of those inputs is in
-the regression corpus.
+Fuzzing has paid for itself four times so far: that PNG over-read, an overflow
+in the VMDK grain-table geometry, a 185-byte EWF file whose section chain pointed
+in a cycle, and a 149-byte QCOW2 header declaring sixteen exabytes of virtual
+size — which had a handler searching a 1.6×10¹⁹-byte window. The last two were
+hangs rather than crashes: a tool that stops responding on a corrupt image, with
+no output and no explanation. All four inputs are in the regression corpus, which
+now also bounds how long each one may take.
 
 ## Verifying the image first
 
