@@ -162,9 +162,9 @@ fn jpeg_and_gif_report_what_they_can_and_no_more() {
 
 #[test]
 fn a_type_without_a_validator_is_left_alone() {
-    assert!(!validate::can_validate("pdf"));
+    assert!(!validate::can_validate("rtf"));
     assert_eq!(
-        validate::validate("pdf", b"%PDF-1.4 ... %%EOF"),
+        validate::validate("rtf", b"{\\rtf1 hello}"),
         Verdict::Inconclusive
     );
     // ...and one with a validator, handed the wrong bytes, says nothing either.
@@ -270,4 +270,58 @@ fn without_validation_both_documents_look_alike() {
     assert!(records.iter().all(|r| r.decoded.is_none()));
     assert!(records.iter().all(|r| r.confidence() == "high"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pdf_is_checked_against_its_own_cross_reference_offset() {
+    // Both ways a carved PDF goes wrong, and both were found on live evidence:
+    // an end marker belonging to unrelated data further along, and a document
+    // whose trailer was overwritten while it sat in free space -- leaving NULs
+    // where the offset should be.
+    let mut pdf: Vec<u8> = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_at = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 1\ntrailer\n<< /Root 1 0 R >>\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+
+    match validate::validate("pdf", &pdf) {
+        Verdict::Verified(Some(n)) => assert_eq!(n, pdf.len() as u64),
+        other => panic!("a sound PDF: {other:?}"),
+    }
+
+    // Trailing bytes are dropped rather than kept.
+    let mut over = pdf.clone();
+    over.extend_from_slice(&[0x41; 4096]);
+    match validate::validate("pdf", &over) {
+        Verdict::Verified(Some(n)) => assert_eq!(n, pdf.len() as u64, "not tightened"),
+        other => panic!("over-read PDF: {other:?}"),
+    }
+
+    // A NUL where the offset belongs: the trailer is gone, which is what an
+    // overwritten cluster in free space leaves behind.
+    let mut wiped = pdf.clone();
+    let at = wiped
+        .windows(9)
+        .position(|w| w == b"startxref")
+        .expect("startxref");
+    let eof = wiped
+        .windows(5)
+        .rposition(|w| w == b"%%EOF")
+        .expect("%%EOF");
+    for b in wiped[at + 9..eof].iter_mut() {
+        *b = 0;
+    }
+    assert_eq!(validate::validate("pdf", &wiped), Verdict::Invalid);
+
+    // An offset outside the carve, which is what an over-carved PDF looks like:
+    // the trailer describes a document larger than the bytes on hand.
+    let bad = String::from_utf8_lossy(&pdf)
+        .replace(&format!("startxref\n{xref_at}"), "startxref\n99999999")
+        .into_bytes();
+    assert_eq!(validate::validate("pdf", &bad), Verdict::Invalid);
+
+    // Not a PDF at all: say nothing rather than condemn it.
+    assert_eq!(
+        validate::validate("pdf", b"just some bytes"),
+        Verdict::Inconclusive
+    );
 }

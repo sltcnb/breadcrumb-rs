@@ -376,6 +376,80 @@ fn sqlite(data: &[u8]) -> Verdict {
     }
 }
 
+// -- PDF -------------------------------------------------------------------
+
+/// A PDF has no checksum, but it does say where its cross-reference table is,
+/// and that is enough to catch the two ways a carved one goes wrong: an end
+/// marker belonging to unrelated data further along, and a document whose middle
+/// was overwritten while it sat in free space (the offset is then a run of NULs
+/// where a number should be).
+fn pdf(data: &[u8]) -> Verdict {
+    if data.len() < 32 || !data.starts_with(b"%PDF-") {
+        return Verdict::Inconclusive;
+    }
+    // Each `%%EOF` is a candidate end, newest first: a revised document has
+    // several, and a carve that over-read has junk after the real one. The end
+    // is the newest whose `startxref` resolves.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut from = data.len();
+    while let Some(rel) = rfind(&data[..from], b"%%EOF") {
+        ends.push(rel);
+        if ends.len() >= 32 || rel == 0 {
+            break;
+        }
+        from = rel;
+    }
+    if ends.is_empty() {
+        return Verdict::Invalid;
+    }
+    for &eof in &ends {
+        let back = eof.saturating_sub(64);
+        let Some(sx) = rfind(&data[back..eof], b"startxref") else {
+            continue;
+        };
+        let digits: Vec<u8> = data[back + sx + 9..eof]
+            .iter()
+            .copied()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .take_while(|b| b.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            continue; // a NUL or nothing where the offset should be
+        }
+        let Ok(off) = std::str::from_utf8(&digits).unwrap_or("x").parse::<usize>() else {
+            continue;
+        };
+        if off == 0 || off >= data.len() {
+            continue;
+        }
+        let there = &data[off..(off + 24).min(data.len())];
+        let resolves = there.starts_with(b"xref") || there.windows(3).take(12).any(|w| w == b"obj");
+        if !resolves {
+            continue;
+        }
+        // Tighten to the end of this %%EOF line, dropping anything after it.
+        let mut end = eof + 5;
+        if data.get(end..end + 2) == Some(b"\r\n".as_slice()) {
+            end += 2;
+        } else if matches!(data.get(end), Some(b'\r') | Some(b'\n')) {
+            end += 1;
+        }
+        return Verdict::Verified(Some(end as u64));
+    }
+    // Every candidate end failed to resolve: the trailer was overwritten, or
+    // these bytes are not one document.
+    Verdict::Invalid
+}
+
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
 // -- dispatch --------------------------------------------------------------
 
 /// Is there a validator for this extension?
@@ -396,6 +470,7 @@ pub fn can_validate(ext: &str) -> bool {
             | "odf"
             | "gz"
             | "sqlite"
+            | "pdf"
     )
 }
 
@@ -408,6 +483,7 @@ pub fn validate(ext: &str, data: &[u8]) -> Verdict {
         "bmp" => bmp(data),
         "zip" | "docx" | "xlsx" | "pptx" | "apk" | "jar" | "epub" | "odf" => zip(data),
         "gz" => gzip(data),
+        "pdf" => pdf(data),
         "sqlite" => sqlite(data),
         _ => Verdict::Inconclusive,
     }
