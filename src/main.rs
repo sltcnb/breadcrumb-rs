@@ -847,7 +847,14 @@ fn run() -> Result<ExitCode, String> {
         let recs = run_ranges(&reader, &sigs, &opts, &ranges, scan_end, |a, b| {
             state.complete(a, b)
         });
-        let complete = state.remaining(opts.start, scan_end).is_empty();
+        // With --unallocated the allocated ranges are never going to be
+        // scanned, so completeness is measured against what was planned rather
+        // than against the whole volume -- otherwise every run ends by telling
+        // the analyst to resume something that is already finished.
+        let complete = match &free {
+            Some(free) => free.iter().all(|&(a, b)| state.remaining(a, b).is_empty()),
+            None => state.remaining(opts.start, scan_end).is_empty(),
+        };
         let mut merged = recs;
         if resume {
             merged = merge_with_existing(&opts.out_dir, merged);
@@ -855,10 +862,14 @@ fn run() -> Result<ExitCode, String> {
         if complete {
             state.finish();
         } else if !opts.quiet {
+            let target = match &free {
+                Some(free) => free.iter().map(|&(a, b)| b - a).sum(),
+                None => scan_end - opts.start,
+            };
             eprintln!(
                 "scan incomplete: {} of {} done. Re-run with --resume to continue",
                 human(state.bytes_done()),
-                human(scan_end - opts.start)
+                human(target)
             );
         }
         merged
