@@ -361,7 +361,41 @@ impl EwfReader {
         ((end - c.offset) as usize).min(self.chunk_size as usize * 2 + 1024)
     }
 
+    /// A few recently decoded chunks, per thread.
+    ///
+    /// Decoding is expensive -- a read from the segment file and an inflate of
+    /// the whole chunk -- and callers come back to the same chunk over and over:
+    /// a 32 KiB chunk serves 64 sectors, and anything reading sector by sector
+    /// would otherwise decode it 64 times. Per-thread so the scan's workers
+    /// never contend on it.
     fn chunk_bytes(&self, idx: usize) -> Vec<u8> {
+        thread_local! {
+            static CACHE: std::cell::RefCell<Vec<(usize, u64, Vec<u8>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        // Keyed by the reader as well as the chunk, since a process can have
+        // more than one image open.
+        let key = self as *const _ as u64;
+        if let Some(hit) = CACHE.with(|c| {
+            c.borrow()
+                .iter()
+                .find(|(i, k, _)| *i == idx && *k == key)
+                .map(|(_, _, data)| data.clone())
+        }) {
+            return hit;
+        }
+        let data = self.decode_chunk(idx);
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= 8 {
+                c.remove(0);
+            }
+            c.push((idx, key, data.clone()));
+        });
+        data
+    }
+
+    fn decode_chunk(&self, idx: usize) -> Vec<u8> {
         let c = &self.chunks[idx];
         if !c.compressed {
             return self.read_at(c.segment, c.offset, self.chunk_size as usize);

@@ -585,9 +585,42 @@ impl Volume {
         let mut end = offset + length;
         end += (ss - end % ss) % ss;
         let mut out = Vec::with_capacity((end - start) as usize);
+
+        // Read the whole span once, then decrypt within it. Fetching each
+        // sector separately makes every 512-byte sector its own read of the
+        // source, and when the source is an E01 that means locating,
+        // re-reading and re-inflating the same 32 KiB chunk for all 64 sectors
+        // in it. Measured on a live 238 GB E01: the scan had read 1,645 GiB.
+        // Sectors below this come from the relocated header, wherever that is;
+        // the rest are contiguous and can be fetched in one go.
+        let reloc_end = if self.header_src != 0 {
+            self.header_bytes
+        } else {
+            0
+        };
+        let plain_start = start.max(reloc_end.min(end));
+        let bulk = if end > plain_start {
+            src.pread(self.base + plain_start, (end - plain_start) as usize)
+        } else {
+            Vec::new()
+        };
+
         let mut pos = start;
         while pos < end {
-            out.extend_from_slice(&self.decrypt_one(src, pos));
+            if pos < reloc_end {
+                // The relocated header is a handful of sectors somewhere else.
+                out.extend_from_slice(&self.decrypt_one(src, pos));
+            } else {
+                let at = (pos - plain_start) as usize;
+                let mut ct = bulk
+                    .get(at..at + ss as usize)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                if ct.len() < ss as usize {
+                    ct.resize(ss as usize, 0);
+                }
+                out.extend_from_slice(&self.cipher.decrypt_sector(pos / ss, &ct));
+            }
             pos += ss;
         }
         let lo = (offset - start) as usize;
