@@ -1,6 +1,6 @@
 //! bcrumb-rs: signature-based file carver for disk images and block devices.
 
-use breadcrumb_rs::carver::{run_parallel, run_ranges, Options, Record};
+use breadcrumb_rs::carver::{run_parallel, run_ranges, Options, Progress, Record};
 use breadcrumb_rs::checkpoint;
 use breadcrumb_rs::json;
 use breadcrumb_rs::reader::Source;
@@ -815,9 +815,26 @@ fn run() -> Result<ExitCode, String> {
     // that is, and the range scanner below already carves a file that starts in
     // a range and continues past its end.
 
+    // What the scan intends to read, for the progress line.
+    let planned: u64 = match &free {
+        Some(ranges) => ranges.iter().map(|&(a, b)| b - a).sum(),
+        None => scan_end.saturating_sub(opts.start),
+    };
+    let progress = Progress::new(planned);
+    let stop_reporting = std::sync::atomic::AtomicBool::new(false);
+    let show_progress = !opts.quiet || machine;
+
     let records = if opts.dry_run {
         match &free {
-            Some(ranges) => run_ranges(&reader, &sigs, &opts, ranges, scan_end, |_, _| {}),
+            Some(ranges) => run_ranges(
+                &reader,
+                &sigs,
+                &opts,
+                ranges,
+                scan_end,
+                Some(&progress),
+                |_, _| {},
+            ),
             None => run_parallel(&reader, &sigs, &opts),
         }
     } else {
@@ -844,8 +861,21 @@ fn run() -> Result<ExitCode, String> {
                 ranges.len()
             );
         }
-        let recs = run_ranges(&reader, &sigs, &opts, &ranges, scan_end, |a, b| {
-            state.complete(a, b)
+        let recs = std::thread::scope(|scope| {
+            if show_progress {
+                spawn_reporter(&progress, &stop_reporting, machine, scope);
+            }
+            let recs = run_ranges(
+                &reader,
+                &sigs,
+                &opts,
+                &ranges,
+                scan_end,
+                Some(&progress),
+                |a, b| state.complete(a, b),
+            );
+            stop_reporting.store(true, std::sync::atomic::Ordering::Relaxed);
+            recs
         });
         // With --unallocated the allocated ranges are never going to be
         // scanned, so completeness is measured against what was planned rather
@@ -2061,6 +2091,99 @@ fn unallocated_unsupported(fs: &str) -> String {
          (NTFS, FAT/exFAT and ext are). Scan the whole volume instead, or point \
          --offset at a volume that is."
     )
+}
+
+/// Report how far a running scan has got, until it is told to stop.
+///
+/// A carve of a real disk runs for hours. Without this the only output was the
+/// summary at the end, so an analyst could not tell a slow scan from a stuck one
+/// -- on a live 237 GB image there was nothing to distinguish sixteen hours of
+/// progress from sixteen hours of a hang.
+fn spawn_reporter<'a>(
+    progress: &'a Progress,
+    stop: &'a std::sync::atomic::AtomicBool,
+    machine: bool,
+    scope: &'a std::thread::Scope<'a, '_>,
+) {
+    use std::io::IsTerminal;
+    use std::sync::atomic::Ordering;
+
+    scope.spawn(move || {
+        // Overwrite one line on a terminal; on a log, print a new line each
+        // time so the history is kept.
+        let tty = std::io::stderr().is_terminal();
+        let started = Instant::now();
+        // Quiet for the first few seconds, so a short scan says nothing, then
+        // every five.
+        let mut next = std::time::Duration::from_secs(3);
+        let mut printed = false;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let elapsed = started.elapsed();
+            if elapsed < next {
+                continue;
+            }
+            next = elapsed + std::time::Duration::from_secs(5);
+            let done = progress.scanned();
+            if done == 0 {
+                continue;
+            }
+            let secs = elapsed.as_secs_f64();
+            let rate = done as f64 / secs;
+            if machine {
+                println!(
+                    "{}",
+                    json::object(vec![
+                        ("event", json::string("progress")),
+                        ("scanned", json::number(done)),
+                        ("total", json::number(progress.total)),
+                        ("files", json::number(progress.files())),
+                        ("bytes_out", json::number(progress.bytes_out())),
+                        ("elapsed_s", json::float(secs)),
+                        ("rate_bytes_s", json::number(rate as u64)),
+                    ])
+                );
+                continue;
+            }
+            let pct = if progress.total > 0 {
+                100.0 * done as f64 / progress.total as f64
+            } else {
+                0.0
+            };
+            let eta = if rate > 0.0 && progress.total > done {
+                format_duration(((progress.total - done) as f64 / rate) as u64)
+            } else {
+                "--".to_string()
+            };
+            let line = format!(
+                "  {} of {} ({pct:.1}%) · {}/s · {} file(s), {} · ETA {eta}",
+                human(done),
+                human(progress.total),
+                human(rate as u64),
+                progress.files(),
+                human(progress.bytes_out()),
+            );
+            printed = true;
+            if tty {
+                eprint!("\r{line}\x1b[K");
+            } else {
+                eprintln!("{line}");
+            }
+        }
+        if tty && printed {
+            eprintln!();
+        }
+    });
+}
+
+/// Seconds as something an analyst can read at a glance.
+fn format_duration(secs: u64) -> String {
+    match secs {
+        s if s < 90 => format!("{s}s"),
+        s if s < 5400 => format!("{}m", s / 60),
+        s if s < 86_400 * 2 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{}h", s / 86_400, (s % 86_400) / 3600),
+    }
 }
 
 /// Deletion times, which carving and the MFT alone cannot give.

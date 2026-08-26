@@ -45,6 +45,50 @@ impl Record {
     }
 }
 
+/// What a running scan has got through, for reporting while it runs.
+///
+/// A scan of a real disk takes hours, and until this existed the only output
+/// was the summary at the end: an analyst had no way to tell a slow scan from a
+/// stuck one, or to know whether to wait ten minutes or ten hours.
+#[derive(Default)]
+pub struct Progress {
+    scanned: AtomicU64,
+    files: AtomicU64,
+    bytes_out: AtomicU64,
+    /// Total this scan intends to read, for the percentage.
+    pub total: u64,
+}
+
+impl Progress {
+    pub fn new(total: u64) -> Self {
+        Progress {
+            total,
+            ..Default::default()
+        }
+    }
+
+    pub fn add_scanned(&self, n: u64) {
+        self.scanned.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_file(&self, bytes: u64) {
+        self.files.fetch_add(1, Ordering::Relaxed);
+        self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(Ordering::Relaxed)
+    }
+
+    pub fn files(&self) -> u64 {
+        self.files.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_out(&self) -> u64 {
+        self.bytes_out.load(Ordering::Relaxed)
+    }
+}
+
 /// Shared limit on what a scan may write.
 ///
 /// A carve of a large disk can produce more than the volume it is written to
@@ -146,6 +190,7 @@ impl Default for Options {
 
 pub struct Carver<'a> {
     reader: &'a Source,
+    progress: Option<&'a Progress>,
     opts: &'a Options,
     /// Budget shared with the other workers of a parallel scan.
     budget: Option<&'a OutputBudget>,
@@ -186,6 +231,7 @@ impl<'a> Carver<'a> {
             .expect("signature magics build an automaton");
         Carver {
             reader,
+            progress: None,
             opts,
             budget: None,
             owned_budget: (opts.max_output > 0).then(|| OutputBudget::new(opts.max_output)),
@@ -196,6 +242,12 @@ impl<'a> Carver<'a> {
             skipped_blank: 0,
             window_end: 0,
         }
+    }
+
+    /// Report progress into a counter shared with the other workers.
+    pub fn with_progress(mut self, progress: &'a Progress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// Share an output budget with the other workers of this scan.
@@ -246,6 +298,9 @@ impl<'a> Carver<'a> {
             if o.skip_blank && buf[..limit as usize].iter().all(|&b| b == 0) {
                 self.skipped_blank += limit;
                 pos += limit;
+                if let Some(p) = self.progress {
+                    p.add_scanned(limit);
+                }
                 continue;
             }
             // Collect the chunk's candidate offsets before carving: carving
@@ -285,6 +340,9 @@ impl<'a> Carver<'a> {
                     if let Some(rec) = self.try_carve(sig, start) {
                         let validated = rec.validated;
                         let end = rec.offset + rec.size;
+                        if let Some(p) = self.progress {
+                            p.add_file(rec.size);
+                        }
                         records.push(rec);
                         if o.skip_carved && validated {
                             next_allowed = end;
@@ -294,6 +352,9 @@ impl<'a> Carver<'a> {
                 }
             }
             pos += limit;
+            if let Some(p) = self.progress {
+                p.add_scanned(limit);
+            }
         }
         if o.dedup {
             dedupe(&mut records, o.dry_run);
@@ -503,15 +564,22 @@ pub fn dedupe(records: &mut [Record], dry_run: bool) {
 ///
 /// Used by --resume: the caller works out which parts are still outstanding and
 /// hands them over, so a run that died leaves the rest of the work intact.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ranges(
     reader: &Source,
     sigs: &[&'static Signature],
     opts: &Options,
     ranges: &[(u64, u64)],
     scan_end: u64,
-    mut on_range_done: impl FnMut(u64, u64),
+    progress: Option<&Progress>,
+    on_range_done: impl FnMut(u64, u64) + Send,
 ) -> Vec<Record> {
     let budget = OutputBudget::new(opts.max_output);
+    // Ranges finish at different times, and a range that finished should be
+    // recorded then rather than when the slowest of its batch does: a live scan
+    // of a 237 GB image had completed nothing after sixteen hours because the
+    // whole batch had to join first, so nothing was resumable.
+    let on_range_done = std::sync::Mutex::new(on_range_done);
     let mut out: Vec<Record> = Vec::new();
     let jobs = opts.jobs.max(1);
     for chunk in ranges.chunks(jobs.max(1)) {
@@ -531,20 +599,27 @@ pub fn run_ranges(
                 sub.jobs = 1;
                 let sigs = sigs.to_vec();
                 let budget = &budget;
+                let done = &on_range_done;
                 handles.push(scope.spawn(move || {
                     let mut c = Carver::new(reader, sigs, &sub).with_budget(budget);
-                    (start, end, c.run())
+                    if let Some(p) = progress {
+                        c = c.with_progress(p);
+                    }
+                    let recs = c.run();
+                    if !budget.exhausted() {
+                        if let Ok(mut f) = done.lock() {
+                            f(start, end);
+                        }
+                    }
+                    (start, end, recs)
                 }));
             }
             for h in handles {
                 produced.push(h.join().expect("scan worker panicked"));
             }
         });
-        for (start, end, recs) in produced {
+        for (_start, _end, recs) in produced {
             out.extend(recs);
-            if !budget.exhausted() {
-                on_range_done(start, end);
-            }
         }
     }
     let mut out = containment_filter(out);

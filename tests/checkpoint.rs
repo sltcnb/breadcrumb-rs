@@ -142,10 +142,10 @@ fn a_resumed_scan_finds_what_one_pass_finds() {
     let end = img.len() as u64;
     let mid = end / 2;
     let mut done: Vec<(u64, u64)> = Vec::new();
-    let mut first = run_ranges(&reader, &sigs, &opts, &[(0, mid)], end, |a, b| {
+    let mut first = run_ranges(&reader, &sigs, &opts, &[(0, mid)], end, None, |a, b| {
         done.push((a, b))
     });
-    let second = run_ranges(&reader, &sigs, &opts, &[(mid, end)], end, |a, b| {
+    let second = run_ranges(&reader, &sigs, &opts, &[(mid, end)], end, None, |a, b| {
         done.push((a, b))
     });
     first.extend(second);
