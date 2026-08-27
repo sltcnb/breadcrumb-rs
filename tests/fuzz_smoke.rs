@@ -282,6 +282,7 @@ fn filesystem_parsers_survive_mutated_volumes() {
                 dry_run: true,
                 include_live: true,
                 min_size: 0,
+                only_path: None,
             },
             |_| {},
         );

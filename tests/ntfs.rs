@@ -31,6 +31,7 @@ fn recover(tag: &str, include_live: bool) -> (Vec<ntfs::FileRecord>, PathBuf) {
         dry_run: false,
         include_live,
         min_size: 0,
+        only_path: None,
     };
     let recs = ntfs::recover(&src, 0, &opts, |_| {}).expect("recover failed");
     (recs, out)
@@ -115,6 +116,7 @@ fn a_volume_without_ntfs_is_refused() {
         dry_run: true,
         include_live: false,
         min_size: 0,
+        only_path: None,
     };
     let err = ntfs::recover(&src, 0, &opts, |_| {})
         .err()
@@ -231,6 +233,7 @@ fn a_path_through_a_reused_parent_record_is_not_invented() {
         dry_run: true,
         include_live: false,
         min_size: 0,
+        only_path: None,
     };
     let recs = ntfs::recover(&src, 0, &opts, |_| {}).expect("recover failed");
     let rec = recs
@@ -291,5 +294,51 @@ fn an_inventory_writes_a_csv_and_leaves_stdout_alone() {
 
     // Nothing was extracted: an inventory reads metadata, not file content.
     assert!(!out.join("manifest.json").exists());
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn only_one_corner_of_the_volume_can_be_asked_for() {
+    // A volume holds a million files and an examination usually wants one
+    // corner of it -- a recycle bin, one user's profile. Extracting everything
+    // to get at a few hundred files costs hours and a disk to put them on.
+    let src = Source::open(fixture().to_str().unwrap()).unwrap();
+    let out = out_dir("only-path");
+    let all = ntfs::recover(
+        &src,
+        0,
+        &ntfs::Options {
+            out_dir: out.to_string_lossy().to_string(),
+            dry_run: true,
+            include_live: true,
+            min_size: 0,
+            only_path: None,
+        },
+        |_| {},
+    )
+    .expect("recover failed");
+    let wanted = all
+        .iter()
+        .find(|r| r.name.contains("deleted-resident"))
+        .expect("fixture changed");
+    let needle = "deleted-resident".to_string();
+
+    let some = ntfs::recover(
+        &src,
+        0,
+        &ntfs::Options {
+            out_dir: out.to_string_lossy().to_string(),
+            dry_run: true,
+            include_live: true,
+            min_size: 0,
+            only_path: Some(needle.clone()),
+        },
+        |_| {},
+    )
+    .expect("recover failed");
+    assert!(some.len() < all.len(), "the filter kept everything");
+    assert!(!some.is_empty(), "the filter kept nothing");
+    assert!(some.iter().all(|r| r.name.to_lowercase().contains(&needle)));
+    assert!(some.iter().any(|r| r.mft == wanted.mft));
     let _ = std::fs::remove_dir_all(&out);
 }

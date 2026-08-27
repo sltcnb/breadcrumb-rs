@@ -717,6 +717,10 @@ pub struct Options {
     pub dry_run: bool,
     pub include_live: bool,
     pub min_size: u64,
+    /// Recover only files whose path contains this, matched without case.
+    /// A volume holds a million files and an examination usually wants one
+    /// corner of it -- a recycle bin, one user's profile, one folder.
+    pub only_path: Option<String>,
 }
 
 /// Walk the MFT and recover deleted files.
@@ -808,6 +812,11 @@ fn recover_stream(
     };
     if size < opts.min_size.max(1) {
         return None;
+    }
+    if let Some(want) = &opts.only_path {
+        if !vpath.to_lowercase().contains(want) {
+            return None;
+        }
     }
     let runs: &[Run] = if stream.resident {
         &[]

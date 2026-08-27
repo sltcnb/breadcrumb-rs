@@ -348,3 +348,49 @@ fn ccm_rejects_a_tampered_blob() {
                  // A blob that is not a valid CCM package must not decrypt.
     assert!(crypto::ccm_decrypt(&key, &nonce, &[0u8; 48], 16).is_none());
 }
+
+#[test]
+fn a_decrypted_copy_can_be_written_out_for_other_tools() {
+    // PhotoRec, sleuthkit and the operating system's own mounter read neither
+    // E01 nor BitLocker. A second opinion on the same evidence needs a copy
+    // that they can open, and it has to be the same bytes this tool carves.
+    let img = fixture("bitlocker_xts256.dd");
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("bcrumb-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let raw = dir.join("clair.dd");
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_bcrumb-rs"))
+        .arg(&img)
+        .arg("--export-raw")
+        .arg(&raw)
+        .args(["--bitlocker-recovery-key", RECOVERY, "-q"])
+        .output()
+        .expect("export failed to run");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // The copy is the decrypted volume: same length, and what the reader sees
+    // through the cipher is what landed in the file.
+    let src = Source::open(img.to_str().unwrap()).unwrap();
+    let creds = Credentials {
+        recovery: Some(RECOVERY.into()),
+        ..Default::default()
+    };
+    let unlocked = src.unlock_bitlocker(&creds, false, |_| {}).unwrap();
+    let copy = std::fs::read(&raw).unwrap();
+    assert_eq!(copy.len() as u64, unlocked.size());
+    assert_eq!(copy[..4096], unlocked.pread(0, 4096)[..]);
+    let tail = unlocked.size() - 4096;
+    assert_eq!(copy[tail as usize..], unlocked.pread(tail, 4096)[..]);
+
+    // And it is really decrypted, not a byte-for-byte duplicate of the image:
+    // the ciphertext on disk does not survive into the copy.
+    let ciphertext = std::fs::read(&img).unwrap();
+    assert_ne!(copy[4096..8192], ciphertext[4096..8192]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

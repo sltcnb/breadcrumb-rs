@@ -105,6 +105,12 @@ options:
       --machine           JSON-lines events on stdout (for wrapping)
       --hexdump OFF[:LEN] print LEN bytes at OFF (decoded, after any unlock)
                           and exit; for inspecting a structure by hand
+      --only-path TEXT    with --ntfs, keep only files whose path contains
+                          TEXT (no case); a volume holds a million files and
+                          an examination usually wants one corner of it
+      --export-raw FILE   write the decoded image -- E01 chunks expanded,
+                          BitLocker decrypted -- to a raw file, so tools that
+                          read neither format can work on the same evidence
       --dump-fve          describe the BitLocker metadata (entry types, sizes,
                           protectors, payload shapes) and exit; no key material
   -q, --quiet             no progress output
@@ -338,6 +344,7 @@ fn run() -> Result<ExitCode, String> {
     let mut creds = breadcrumb_rs::bitlocker::Credentials::default();
     let mut scan_metadata = false;
     let mut hexdump: Option<(u64, usize)> = None;
+    let mut export_raw: Option<String> = None;
     let mut dump_fve = false;
     let mut verify = false;
     let mut resume = false;
@@ -350,6 +357,7 @@ fn run() -> Result<ExitCode, String> {
     let mut unallocated = false;
     let mut list_free = false;
     let mut include_live = false;
+    let mut only_path: Option<String> = None;
     let mut grep_regex = false;
     let mut sig_file: Option<String> = None;
     let mut only_custom = false;
@@ -439,6 +447,7 @@ fn run() -> Result<ExitCode, String> {
                 unallocated = true;
             }
             "--include-live" => include_live = true,
+            "--only-path" => only_path = Some(next(&mut i)?.to_lowercase()),
             "--deleted-times" => deleted_times = true,
             "--usn-all" => usn_all = true,
             "--events" => events_path = Some(next(&mut i)?),
@@ -473,6 +482,7 @@ fn run() -> Result<ExitCode, String> {
                 };
                 hexdump = Some((off, len));
             }
+            "--export-raw" => export_raw = Some(next(&mut i)?),
             "--bitlocker-bek" => {
                 let path = next(&mut i)?;
                 creds.bek = Some(
@@ -642,6 +652,10 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    if let Some(path) = export_raw {
+        return export_image(&reader, &path, opts.start, opts.quiet);
+    }
+
     if verify {
         return verify_image(&reader, opts.quiet);
     }
@@ -651,7 +665,14 @@ fn run() -> Result<ExitCode, String> {
     }
 
     if ntfs_mode {
-        return run_ntfs(&reader, &opts, include_live, machine, csv_path.as_deref());
+        return run_ntfs(
+            &reader,
+            &opts,
+            include_live,
+            only_path,
+            machine,
+            csv_path.as_deref(),
+        );
     }
 
     if fat_mode {
@@ -1870,6 +1891,7 @@ fn recover_one(
                 dry_run: opts.dry_run,
                 include_live,
                 min_size: opts.min_size,
+                only_path: None,
             };
             for r in ntfs::recover(reader, base, &o, |_| {})? {
                 let confidence = r.confidence();
@@ -2374,6 +2396,7 @@ fn run_ntfs(
     reader: &Source,
     opts: &Options,
     include_live: bool,
+    only_path: Option<String>,
     machine: bool,
     csv_path: Option<&str>,
 ) -> Result<ExitCode, String> {
@@ -2387,6 +2410,7 @@ fn run_ntfs(
         dry_run: opts.dry_run,
         include_live,
         min_size: opts.min_size,
+        only_path,
     };
     let started = Instant::now();
     let quiet = opts.quiet;
@@ -2521,6 +2545,52 @@ fn run_ntfs(
         eprintln!(
             "recovered {} file(s) ({deleted} deleted) in {elapsed:.2}s",
             records.len()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write the decoded image to a raw file.
+///
+/// An E01 is compressed and a BitLocker volume is encrypted; between them, a
+/// tool that reads neither -- PhotoRec, a sleuthkit build, an operating
+/// system's own mounter -- cannot look at the evidence at all. This writes what
+/// this tool sees: chunks expanded, sectors decrypted, nothing else changed.
+/// It is a copy, so it needs as much room as the volume it copies.
+fn export_image(reader: &Source, path: &str, start: u64, quiet: bool) -> Result<ExitCode, String> {
+    use std::io::Write;
+
+    const BLOCK: usize = 8 << 20;
+    let total = reader.size().saturating_sub(start);
+    if total == 0 {
+        return Err(format!("{path}: nothing to export at offset {start}"));
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut out = std::io::BufWriter::with_capacity(BLOCK, file);
+    let started = Instant::now();
+    let mut done = 0u64;
+    let mut last_pct = u64::MAX;
+    while done < total {
+        let want = BLOCK.min((total - done) as usize);
+        let data = reader.pread(start + done, want);
+        if data.is_empty() {
+            return Err(format!("{path}: source went short at {}", start + done));
+        }
+        out.write_all(&data).map_err(|e| format!("{path}: {e}"))?;
+        done += data.len() as u64;
+        if !quiet {
+            let pct = done * 100 / total;
+            if pct != last_pct {
+                eprint!("\rexporting {pct}%");
+                last_pct = pct;
+            }
+        }
+    }
+    out.flush().map_err(|e| format!("{path}: {e}"))?;
+    if !quiet {
+        eprintln!(
+            "\rexported {done} bytes to {path} in {}",
+            format_duration(started.elapsed().as_secs())
         );
     }
     Ok(ExitCode::SUCCESS)
