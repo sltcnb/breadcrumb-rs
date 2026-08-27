@@ -130,7 +130,10 @@ impl<'a> Volume<'a> {
         // Clusters per MFT record, or -log2(bytes) when negative.
         let cpr = boot[64];
         let record_size = if cpr > 127 {
-            1u64 << (256 - cpr as u64)
+            // Read as a signed byte, a negative value means 2^-cpr bytes. A
+            // byte says nothing about how far it may be shifted: 0x80 asks for
+            // 1 << 128, which is not a large number, it is a panic.
+            1u64.checked_shl(256 - cpr as u32).unwrap_or(0)
         } else {
             (cpr as u64).saturating_mul(cluster)
         };

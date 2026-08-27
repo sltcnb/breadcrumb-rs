@@ -96,3 +96,47 @@ fn a_hostile_ewf_section_chain_does_not_walk_forever() {
     }
     assert!(count > 0, "no EWF regression inputs found");
 }
+
+#[test]
+fn a_boot_sector_asking_for_an_impossible_record_size_is_refused() {
+    // Byte 64 of an NTFS boot sector is clusters-per-record, or -log2(bytes)
+    // when read as a signed byte. 0x80 is -128, so it asks for a record of
+    // 1 << 128 bytes -- and a shift that wide is not a big number, it is a
+    // panic. Found by the fuzzer on the filesystems target.
+    let mut boot = vec![0u8; 8192];
+    boot[3..11].copy_from_slice(b"NTFS    ");
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 8;
+    boot[40..48].copy_from_slice(&16u64.to_le_bytes());
+    boot[48..56].copy_from_slice(&1u64.to_le_bytes());
+    boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("bcrumb-shift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("disk.img");
+
+    // Every byte that reads as negative must be refused or accepted, never
+    // panic -- and only the shifts that land in range can be accepted.
+    for cpr in 128u16..=255 {
+        boot[64] = cpr as u8;
+        std::fs::write(&img, &boot).unwrap();
+        let src = breadcrumb_rs::reader::Source::open(img.to_str().unwrap()).unwrap();
+        let opts = breadcrumb_rs::ntfs::Options {
+            out_dir: dir.join("out").to_string_lossy().to_string(),
+            dry_run: true,
+            include_live: false,
+            min_size: 0,
+            only_path: None,
+        };
+        let got = breadcrumb_rs::ntfs::recover(&src, 0, &opts, |_| {});
+        if !(240..=248).contains(&cpr) {
+            assert!(
+                got.is_err(),
+                "cpr {cpr:#x} produced a record size out of range"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

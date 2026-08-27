@@ -36,6 +36,7 @@ fuzz_target!(|data: &[u8]| {
             dry_run: true,
             include_live: true,
             min_size: 0,
+            only_path: None,
         },
         |_| {},
     );
