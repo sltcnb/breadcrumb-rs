@@ -909,11 +909,7 @@ pub fn free_ranges(src: &Source, base: u64, merge_gap: u64) -> Result<FreeSpace,
     if bitmap.is_empty() {
         return Err("NTFS $Bitmap is empty".into());
     }
-    let clusters = if vol.cluster == 0 {
-        0
-    } else {
-        vol.volume_size / vol.cluster
-    };
+    let clusters = vol.volume_size.checked_div(vol.cluster).unwrap_or(0);
     if clusters == 0 {
         return Err("NTFS volume has no clusters".into());
     }
