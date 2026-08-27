@@ -383,6 +383,10 @@ struct Info {
     base_record: u64,
     name: String,
     parent: Option<u64>,
+    /// This record's own sequence number, bumped every time NTFS reuses it.
+    seq: u64,
+    /// The sequence the file name claims its parent had.
+    parent_seq: u64,
     namespace: i32,
     timestamps: Timestamps,
     data: Vec<Stream>,
@@ -467,6 +471,9 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
         base_record: u64le(&rec, 32) & 0xFFFF_FFFF_FFFF,
         name: String::new(),
         parent: None,
+        // The record header carries the sequence number at offset 16.
+        seq: u16le(&rec, 16),
+        parent_seq: 0,
         namespace: -1,
         timestamps: Timestamps::default(),
         data: Vec::new(),
@@ -497,7 +504,11 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
                         .map(|p| u16::from_le_bytes([p[0], p[1]]))
                         .filter_map(|u| char::from_u32(u as u32))
                         .collect();
-                    info.parent = Some(u64le(c, 0) & 0xFFFF_FFFF_FFFF);
+                    let reference = u64le(c, 0);
+                    info.parent = Some(reference & 0xFFFF_FFFF_FFFF);
+                    // The top 16 bits say which incarnation of the parent this
+                    // name belonged to.
+                    info.parent_seq = reference >> 48;
                     info.namespace = namespace;
                 }
             }
@@ -560,7 +571,20 @@ fn build_paths(infos: &HashMap<u64, Info>) -> HashMap<u64, String> {
         }
         let path = match infos.get(&num) {
             Some(info) if !info.name.is_empty() && info.parent.is_some() => {
-                let parent = walk(info.parent.unwrap(), depth + 1, infos, cache);
+                let parent_num = info.parent.unwrap();
+                // A deleted file names its parent by record number *and*
+                // sequence. NTFS bumps the sequence every time it reuses a
+                // record, so a mismatch means that record now holds a different
+                // file -- and the path built through it would be fiction. Seen
+                // on real evidence: an 84 MB DLL reported inside a Chrome .pak.
+                let reused = infos
+                    .get(&parent_num)
+                    .is_some_and(|p| info.parent_seq != 0 && p.seq != info.parent_seq);
+                if reused {
+                    cache.insert(num, "_parent_reused_".into());
+                    return "_parent_reused_".into();
+                }
+                let parent = walk(parent_num, depth + 1, infos, cache);
                 let name = sanitize(&info.name);
                 if parent.is_empty() {
                     name

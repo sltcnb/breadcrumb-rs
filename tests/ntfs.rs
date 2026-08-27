@@ -178,3 +178,69 @@ fn free_space_is_exactly_the_complement_of_what_is_allocated() {
     }
     assert_eq!(space.volume_bytes, total * cluster_size);
 }
+
+#[test]
+fn a_path_through_a_reused_parent_record_is_not_invented() {
+    // A deleted file names its parent by record number and sequence. NTFS bumps
+    // that sequence each time it reuses a record, so when they disagree the
+    // record now holds some other file and any path built through it is
+    // fiction. On live evidence this reported an 84 MB DLL as living inside a
+    // Chrome .pak file.
+    let mut data = std::fs::read(fixture()).expect("fixture missing");
+
+    // Point the deleted file's parent at record 5 (the root) but claim a
+    // sequence the root does not have.
+    let boot = &data[..512];
+    let cluster = u16::from_le_bytes([boot[11], boot[12]]) as usize * boot[13] as usize;
+    let mft = u64::from_le_bytes(data[48..56].try_into().unwrap()) as usize * cluster;
+    let rec_size = 1usize << (256 - boot[64] as usize);
+    let target = mft + 65 * rec_size; // deleted-resident.txt
+
+    // Find its $FILE_NAME attribute and rewrite the parent reference's sequence.
+    let attr_off = u16::from_le_bytes([data[target + 20], data[target + 21]]) as usize;
+    let mut pos = target + attr_off;
+    let mut patched = false;
+    while pos + 8 < target + rec_size {
+        let atype = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        let alen = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if atype == 0xFFFF_FFFF || alen == 0 {
+            break;
+        }
+        if atype == 0x30 {
+            let coff = u16::from_le_bytes([data[pos + 20], data[pos + 21]]) as usize;
+            let refr = pos + coff;
+            // sequence lives in the top 16 bits of the 8-byte reference
+            data[refr + 6..refr + 8].copy_from_slice(&0x4242u16.to_le_bytes());
+            patched = true;
+            break;
+        }
+        pos += alen;
+    }
+    assert!(patched, "no $FILE_NAME attribute found to patch");
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("bcrumb-reused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let patched_img = dir.join("disk.img");
+    std::fs::write(&patched_img, &data).unwrap();
+
+    let src = Source::open(patched_img.to_str().unwrap()).unwrap();
+    let opts = ntfs::Options {
+        out_dir: dir.join("out").to_string_lossy().to_string(),
+        dry_run: true,
+        include_live: false,
+        min_size: 0,
+    };
+    let recs = ntfs::recover(&src, 0, &opts, |_| {}).expect("recover failed");
+    let rec = recs
+        .iter()
+        .find(|r| r.mft == 65)
+        .expect("the deleted file should still be recovered");
+    assert!(
+        rec.name.contains("_parent_reused_"),
+        "path claimed through a reused parent: {}",
+        rec.name
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
