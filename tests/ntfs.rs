@@ -242,6 +242,13 @@ fn a_path_through_a_reused_parent_record_is_not_invented() {
         "path claimed through a reused parent: {}",
         rec.name
     );
+    // The parent is unknowable; the file's own name is not, and it is what an
+    // investigator is looking for.
+    assert!(
+        rec.name.ends_with("deleted-resident.txt"),
+        "the file's own name was thrown away with its parent: {}",
+        rec.name
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

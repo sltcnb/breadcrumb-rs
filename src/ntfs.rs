@@ -681,8 +681,13 @@ fn build_paths(infos: &HashMap<u64, PathInfo>) -> HashMap<u64, String> {
                     .get(&parent_num)
                     .is_some_and(|p| info.parent_seq != 0 && p.seq != info.parent_seq);
                 if reused {
-                    cache.insert(num, "_parent_reused_".into());
-                    return "_parent_reused_".into();
+                    // The ancestry is fiction, but the file's own name is not:
+                    // it is written in this record. Losing it would throw away
+                    // the one thing an investigator is looking for, so keep the
+                    // name and say only that the folder above it is unknown.
+                    let unknown = format!("_parent_reused_/{}", sanitize(&info.name));
+                    cache.insert(num, unknown.clone());
+                    return unknown;
                 }
                 let parent = walk(parent_num, depth + 1, infos, cache);
                 let name = sanitize(&info.name);
