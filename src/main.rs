@@ -1179,30 +1179,33 @@ fn run_fat(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "name,ext,offset,size,sha256,deleted,confidence,created,modified,accessed,path\n",
-            );
-            for r in &records {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.offset,
-                    r.size,
-                    r.sha256,
-                    r.deleted,
-                    r.confidence(),
-                    r.timestamps.created,
-                    r.timestamps.modified,
-                    r.timestamps.accessed,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "name,ext,offset,size,sha256,deleted,confidence,created,modified,accessed,path\n",
+        );
+        for r in &records {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
+                r.name.replace(',', ";"),
+                r.ext,
+                r.offset,
+                r.size,
+                r.sha256,
+                r.deleted,
+                r.confidence(),
+                r.timestamps.created,
+                r.timestamps.modified,
+                r.timestamps.accessed,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = records.iter().filter(|r| r.deleted).count();
@@ -1309,31 +1312,34 @@ fn run_ext4(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "inode,name,ext,size,sha256,deleted,confidence,modified,changed,accessed,deleted_at,path\n",
-            );
-            for r in &records {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.inode,
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.size,
-                    r.sha256,
-                    r.deleted,
-                    r.confidence(),
-                    r.timestamps.modified,
-                    r.timestamps.changed,
-                    r.timestamps.accessed,
-                    r.timestamps.deleted,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "inode,name,ext,size,sha256,deleted,confidence,modified,changed,accessed,deleted_at,path\n",
+        );
+        for r in &records {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                r.inode,
+                r.name.replace(',', ";"),
+                r.ext,
+                r.size,
+                r.sha256,
+                r.deleted,
+                r.confidence(),
+                r.timestamps.modified,
+                r.timestamps.changed,
+                r.timestamps.accessed,
+                r.timestamps.deleted,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = records.iter().filter(|r| r.deleted).count();
@@ -1440,30 +1446,33 @@ fn run_hfs(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "cnid,name,ext,size,sha256,deleted,confidence,created,modified,accessed,path\n",
-            );
-            for r in &records {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.cnid,
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.size,
-                    r.sha256,
-                    r.deleted,
-                    r.confidence(),
-                    r.timestamps.created,
-                    r.timestamps.modified,
-                    r.timestamps.accessed,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "cnid,name,ext,size,sha256,deleted,confidence,created,modified,accessed,path\n",
+        );
+        for r in &records {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
+                r.cnid,
+                r.name.replace(',', ";"),
+                r.ext,
+                r.size,
+                r.sha256,
+                r.deleted,
+                r.confidence(),
+                r.timestamps.created,
+                r.timestamps.modified,
+                r.timestamps.accessed,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = records.iter().filter(|r| r.deleted).count();
@@ -1560,29 +1569,32 @@ fn run_apfs(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "file_id,name,ext,size,sha256,confidence,created,modified,accessed,path\n",
-            );
-            for r in &records {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{}\n",
-                    r.file_id,
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.size,
-                    r.sha256,
-                    r.confidence(),
-                    r.timestamps.created,
-                    r.timestamps.modified,
-                    r.timestamps.accessed,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "file_id,name,ext,size,sha256,confidence,created,modified,accessed,path\n",
+        );
+        for r in &records {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{}\n",
+                r.file_id,
+                r.name.replace(',', ";"),
+                r.ext,
+                r.size,
+                r.sha256,
+                r.confidence(),
+                r.timestamps.created,
+                r.timestamps.modified,
+                r.timestamps.accessed,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         eprintln!(
@@ -1792,33 +1804,36 @@ fn run_auto(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "volume,fs,id,name,ext,size,sha256,deleted,confidence,created,modified,accessed,deleted_at,path\n",
-            );
-            for r in &all {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.volume,
-                    r.fs,
-                    r.offset,
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.size,
-                    r.sha256,
-                    r.deleted,
-                    r.confidence,
-                    r.created,
-                    r.modified,
-                    r.accessed,
-                    r.deleted_at,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "volume,fs,id,name,ext,size,sha256,deleted,confidence,created,modified,accessed,deleted_at,path\n",
+        );
+        for r in &all {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                r.volume,
+                r.fs,
+                r.offset,
+                r.name.replace(',', ";"),
+                r.ext,
+                r.size,
+                r.sha256,
+                r.deleted,
+                r.confidence,
+                r.created,
+                r.modified,
+                r.accessed,
+                r.deleted_at,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = all.iter().filter(|r| r.deleted).count();
@@ -2443,31 +2458,34 @@ fn run_ntfs(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(csv) = csv_path {
-            let mut out = String::from(
-                "mft,name,ext,size,sha256,deleted,confidence,created,modified,changed,accessed,path\n",
-            );
-            for r in &records {
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.mft,
-                    r.name.replace(',', ";"),
-                    r.ext,
-                    r.size,
-                    r.sha256,
-                    r.deleted,
-                    r.confidence(),
-                    r.timestamps.created,
-                    r.timestamps.modified,
-                    r.timestamps.changed,
-                    r.timestamps.accessed,
-                    r.path.replace(',', ";")
-                ));
-            }
-            std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
-        }
     } else {
         println!("{manifest}");
+    }
+
+    // An inventory is not recovered data: a dry run writes the CSV so a
+    // volume can be listed without extracting it.
+    if let Some(csv) = csv_path {
+        let mut out = String::from(
+            "mft,name,ext,size,sha256,deleted,confidence,created,modified,changed,accessed,path\n",
+        );
+        for r in &records {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                r.mft,
+                r.name.replace(',', ";"),
+                r.ext,
+                r.size,
+                r.sha256,
+                r.deleted,
+                r.confidence(),
+                r.timestamps.created,
+                r.timestamps.modified,
+                r.timestamps.changed,
+                r.timestamps.accessed,
+                r.path.replace(',', ";")
+            ));
+        }
+        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = records.iter().filter(|r| r.deleted).count();
