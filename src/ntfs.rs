@@ -13,7 +13,7 @@
 use crate::artifacts;
 use crate::reader::Source;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 1601-01-01 to 1970-01-01, in 100 ns units.
 const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
@@ -89,6 +89,7 @@ impl FileRecord {
 /// One extent of a stream. `None` is a sparse run, which reads as zeros.
 type Run = (Option<u64>, u64);
 
+#[derive(Clone)]
 struct Attribute {
     atype: u64,
     name: String,
@@ -398,6 +399,64 @@ struct Stream {
     resident: bool,
 }
 
+/// Every attribute belonging to a record, following its attribute list.
+///
+/// A record holds about a kilobyte. When a file's attributes do not fit -- a
+/// heavily fragmented file whose runlist is long, which on a Windows volume
+/// means `$UsnJrnl:$J` and every large file that has been rewritten often --
+/// NTFS moves them into extension records and leaves an $ATTRIBUTE_LIST behind
+/// pointing at them. Reading only the base record finds no $DATA at all and the
+/// file looks empty, which is why the change journal came back missing from
+/// three real volumes.
+fn attributes_with_list(vol: &Volume, rec: &[u8], num: u64) -> Vec<Attribute> {
+    let mut out = vol.attributes(rec);
+    let list: Vec<Attribute> = out.iter().filter(|a| a.atype == 0x20).cloned().collect();
+    if list.is_empty() {
+        return out;
+    }
+    // The list itself can be resident or not.
+    let mut entries: Vec<u8> = Vec::new();
+    for attr in list {
+        if attr.resident {
+            entries.extend_from_slice(&attr.content);
+        } else if let Some(runs) = attr.runs.as_deref() {
+            entries.extend_from_slice(&vol.read_runs(runs, attr.real_size.min(1 << 20)));
+        }
+    }
+
+    // Entry: type(4) length(2) name length(1) name offset(1) starting VCN(8)
+    // base record reference(8) attribute id(2), then the name.
+    let mut seen: HashSet<u64> = HashSet::new();
+    seen.insert(num);
+    let mut pos = 0usize;
+    while pos + 26 <= entries.len() {
+        let len = u16le(&entries, pos + 4) as usize;
+        if len < 26 || pos + len > entries.len() {
+            break;
+        }
+        let reference = u64le(&entries, pos + 16) & 0xFFFF_FFFF_FFFF;
+        pos += len;
+        // Attributes in the base record are already here; only the extension
+        // records need reading, and each of them only once.
+        if !seen.insert(reference) {
+            continue;
+        }
+        if let Some(ext) = vol.record(reference) {
+            for attr in vol.attributes(&ext) {
+                if attr.atype != 0x20 {
+                    out.push(attr);
+                }
+            }
+        }
+        // A record with thousands of extents still has a bounded list; this
+        // stops a damaged one from being walked for ever.
+        if seen.len() > 4096 {
+            break;
+        }
+    }
+    out
+}
+
 fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
     let rec = vol.record(num)?;
     let flags = u16le(&rec, 22);
@@ -412,7 +471,7 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
         timestamps: Timestamps::default(),
         data: Vec::new(),
     };
-    for attr in vol.attributes(&rec) {
+    for attr in attributes_with_list(vol, &rec, num) {
         match attr.atype {
             0x10 if attr.resident && attr.content.len() >= 32 => {
                 let c = &attr.content;
@@ -442,14 +501,31 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
                     info.namespace = namespace;
                 }
             }
-            0x80 => info.data.push(Stream {
-                name: attr.name.clone(),
-                content: attr.content.clone(),
-                runs: attr.runs.clone(),
-                real_size: attr.real_size,
-                flags: attr.flags,
-                resident: attr.resident,
-            }),
+            0x80 => {
+                // One stream can arrive as several attributes, each carrying a
+                // slice of the runlist, when they came from extension records.
+                // They are already in starting-VCN order.
+                match info.data.iter_mut().find(|s| s.name == attr.name) {
+                    Some(existing) => {
+                        if let Some(more) = attr.runs.clone() {
+                            existing.runs.get_or_insert_with(Vec::new).extend(more);
+                            existing.resident = false;
+                        }
+                        // Only the first fragment carries the real size.
+                        if existing.real_size == 0 {
+                            existing.real_size = attr.real_size;
+                        }
+                    }
+                    None => info.data.push(Stream {
+                        name: attr.name.clone(),
+                        content: attr.content.clone(),
+                        runs: attr.runs.clone(),
+                        real_size: attr.real_size,
+                        flags: attr.flags,
+                        resident: attr.resident,
+                    }),
+                }
+            }
             _ => {}
         }
     }
