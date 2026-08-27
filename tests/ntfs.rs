@@ -244,3 +244,45 @@ fn a_path_through_a_reused_parent_record_is_not_invented() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_inventory_writes_a_csv_and_leaves_stdout_alone() {
+    // A dry run over a real volume lists a million files. The manifest for
+    // that is hundreds of megabytes, and printing it to a terminal is how a
+    // one-minute inventory turns into a log nobody can read. The CSV is the
+    // artifact; stdout stays quiet unless the caller asked for JSON.
+    let out = out_dir("cli-inventory");
+    std::fs::create_dir_all(&out).unwrap();
+    let csv = out.join("inventaire.csv");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_bcrumb-rs"))
+        .arg(fixture())
+        .args(["--ntfs", "--dry-run", "-q", "-o"])
+        .arg(&out)
+        .arg("--csv")
+        .arg(&csv)
+        .output()
+        .expect("inventory failed to run");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        !stdout.contains("\"files\""),
+        "manifest went to stdout: {stdout}"
+    );
+
+    let text = std::fs::read_to_string(&csv).expect("no CSV");
+    let mut lines = text.lines();
+    assert!(lines
+        .next()
+        .unwrap()
+        .starts_with("mft,name,ext,size,sha256,deleted"));
+    assert!(lines.next().is_some(), "inventory is empty");
+
+    // Nothing was extracted: an inventory reads metadata, not file content.
+    assert!(!out.join("manifest.json").exists());
+    let _ = std::fs::remove_dir_all(&out);
+}

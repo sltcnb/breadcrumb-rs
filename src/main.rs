@@ -2478,19 +2478,27 @@ fn run_ntfs(
         std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("{}: {e}", opts.out_dir))?;
         let path = std::path::Path::new(&opts.out_dir).join("manifest.json");
         std::fs::write(&path, manifest).map_err(|e| format!("{}: {e}", path.display()))?;
-    } else {
+    } else if machine {
+        // A dry run has nowhere to put the manifest, so it goes to stdout --
+        // but only when the caller asked for machine output. A million-record
+        // volume is hundreds of megabytes; nobody wants that in a terminal.
         println!("{manifest}");
     }
 
     // An inventory is not recovered data: a dry run writes the CSV so a
     // volume can be listed without extracting it.
     if let Some(csv) = csv_path {
-        let mut out = String::from(
-            "mft,name,ext,size,sha256,deleted,confidence,created,modified,changed,accessed,path\n",
-        );
+        use std::io::Write;
+        let file = std::fs::File::create(csv).map_err(|e| format!("{csv}: {e}"))?;
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(
+            b"mft,name,ext,size,sha256,deleted,confidence,created,modified,changed,accessed,path\n",
+        )
+        .map_err(|e| format!("{csv}: {e}"))?;
         for r in &records {
-            out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            writeln!(
+                out,
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
                 r.mft,
                 r.name.replace(',', ";"),
                 r.ext,
@@ -2503,9 +2511,10 @@ fn run_ntfs(
                 r.timestamps.changed,
                 r.timestamps.accessed,
                 r.path.replace(',', ";")
-            ));
+            )
+            .map_err(|e| format!("{csv}: {e}"))?;
         }
-        std::fs::write(csv, out).map_err(|e| format!("{csv}: {e}"))?;
+        out.flush().map_err(|e| format!("{csv}: {e}"))?;
     }
     if !opts.quiet {
         let deleted = records.iter().filter(|r| r.deleted).count();
