@@ -261,6 +261,51 @@ impl<'a> Volume<'a> {
     }
 
     /// Read MFT record `num` through the MFT's own runlist.
+    /// Walk every MFT record, reading the table in large blocks.
+    ///
+    /// One `pread` per record means millions of tiny reads, each of them going
+    /// through BitLocker decryption and an EWF chunk decode: listing a 1.4
+    /// million record MFT that way took hours, on an image that carves at
+    /// 90 MiB/s. The table is contiguous within each run, so it is read a few
+    /// megabytes at a time and the records are sliced out of the buffer.
+    pub fn for_each_record(&self, mut f: impl FnMut(u64, &[u8])) {
+        const BLOCK: u64 = 8 << 20;
+        let mut num = 0u64;
+        for &(lcn, count) in &self.mft_runs {
+            let run_bytes = count.saturating_mul(self.cluster);
+            let Some(lcn) = lcn else {
+                // A sparse run holds no records, but it still advances the
+                // numbering.
+                num += run_bytes / self.record_size;
+                continue;
+            };
+            let run_start = self.base.saturating_add(lcn.saturating_mul(self.cluster));
+            let mut done = 0u64;
+            while done < run_bytes && num < self.record_count {
+                let want = BLOCK.min(run_bytes - done);
+                let buf = self.src.pread(run_start + done, want as usize);
+                if buf.is_empty() {
+                    return;
+                }
+                let got = buf.len() as u64;
+                let mut at = 0u64;
+                while at + self.record_size <= got && num < self.record_count {
+                    let raw = &buf[at as usize..(at + self.record_size) as usize];
+                    if let Some(rec) = self.fixup(raw) {
+                        f(num, &rec);
+                    }
+                    at += self.record_size;
+                    num += 1;
+                }
+                // A short read leaves a partial record; pick it up next time.
+                done += at;
+                if at == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn record(&self, num: u64) -> Option<Vec<u8>> {
         let mut remaining = num.saturating_mul(self.record_size);
         for &(lcn, count) in &self.mft_runs {
@@ -400,6 +445,11 @@ struct Stream {
     resident: bool,
 }
 
+fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
+    let rec = vol.record(num)?;
+    parse_record_bytes(vol, num, &rec)
+}
+
 /// Every attribute belonging to a record, following its attribute list.
 ///
 /// A record holds about a kilobyte. When a file's attributes do not fit -- a
@@ -458,21 +508,20 @@ fn attributes_with_list(vol: &Volume, rec: &[u8], num: u64) -> Vec<Attribute> {
     out
 }
 
-fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
-    let rec = vol.record(num)?;
-    let flags = u16le(&rec, 22);
+fn parse_record_bytes(vol: &Volume, num: u64, rec: &[u8]) -> Option<Info> {
+    let flags = u16le(rec, 22);
     let mut info = Info {
         num,
         in_use: flags & 1 != 0,
         is_dir: flags & 2 != 0,
-        base_record: u64le(&rec, 32) & 0xFFFF_FFFF_FFFF,
+        base_record: u64le(rec, 32) & 0xFFFF_FFFF_FFFF,
         name: String::new(),
         parent: None,
         namespace: -1,
         timestamps: Timestamps::default(),
         data: Vec::new(),
     };
-    for attr in attributes_with_list(vol, &rec, num) {
+    for attr in attributes_with_list(vol, rec, num) {
         match attr.atype {
             0x10 if attr.resident && attr.content.len() >= 32 => {
                 let c = &attr.content;
@@ -560,14 +609,13 @@ struct PathInfo {
 }
 
 /// First pass: read only what paths are made of.
-fn parse_path_info(vol: &Volume, num: u64) -> Option<PathInfo> {
-    let rec = vol.record(num)?;
+fn parse_path_info(vol: &Volume, rec: &[u8]) -> Option<PathInfo> {
     // Extension records describe another record's attributes.
-    if u64le(&rec, 32) & 0xFFFF_FFFF_FFFF != 0 {
+    if u64le(rec, 32) & 0xFFFF_FFFF_FFFF != 0 {
         return None;
     }
     let mut best: Option<(i32, String, u64, u64)> = None;
-    for attr in vol.attributes(&rec) {
+    for attr in vol.attributes(rec) {
         if attr.atype != 0x30 || !attr.resident || attr.content.len() < 66 {
             continue;
         }
@@ -602,7 +650,7 @@ fn parse_path_info(vol: &Volume, num: u64) -> Option<PathInfo> {
         name,
         parent: Some(parent),
         parent_seq,
-        seq: u16le(&rec, 16),
+        seq: u16le(rec, 16),
     })
 }
 
@@ -671,41 +719,65 @@ pub fn recover(
     src: &Source,
     base: u64,
     opts: &Options,
+    on_file: impl FnMut(&FileRecord),
+) -> Result<Vec<FileRecord>, String> {
+    recover_reporting(src, base, opts, on_file, |_, _| {})
+}
+
+/// As `recover`, reporting how far through the MFT it is.
+///
+/// A walk of a million-record MFT takes minutes and used to say nothing at all
+/// until it finished, which makes a slow pass indistinguishable from a hung one.
+/// `on_progress` is called with (records walked, records total).
+pub fn recover_reporting(
+    src: &Source,
+    base: u64,
+    opts: &Options,
     mut on_file: impl FnMut(&FileRecord),
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<Vec<FileRecord>, String> {
     let vol = Volume::open(src, base)?;
     // Pass one: the path table, which is small. Pass two re-reads each record
     // and lets it go again, so a million-record volume no longer has to fit in
     // memory all at once.
     let mut infos: HashMap<u64, PathInfo> = HashMap::new();
-    for num in 0..vol.record_count {
-        if let Some(info) = parse_path_info(&vol, num) {
+    let total = vol.record_count;
+    vol.for_each_record(|num, rec| {
+        if let Some(info) = parse_path_info(&vol, rec) {
             infos.insert(num, info);
         }
-    }
+        // First of two passes over the table.
+        on_progress(num / 2, total);
+    });
     let paths = build_paths(&infos);
     drop(infos);
     let mut out = Vec::new();
 
-    for num in 0..vol.record_count {
-        let Some(info) = parse_record(&vol, num) else {
-            continue;
+    // Collect the parsed records in one block-read sweep rather than
+    // fetching each by number: a per-record read costs a BitLocker
+    // decrypt and an EWF chunk decode, and there are over a million.
+    // Each record is handled as it is read and then dropped. Collecting them
+    // first costs a gigabyte per few hundred thousand files -- the mistake this
+    // pass was rewritten to avoid.
+    vol.for_each_record(|num, rec| {
+        on_progress(total / 2 + num / 2, total);
+        let Some(info) = parse_record_bytes(&vol, num, rec) else {
+            return;
         };
         if info.base_record != 0 || info.is_dir || info.data.is_empty() || info.name.is_empty() {
-            continue;
+            return;
         }
-        let info = &info;
         if info.in_use && !opts.include_live {
-            continue;
+            return;
         }
         let vpath = paths.get(&num).cloned().unwrap_or_default();
         for stream in &info.data {
-            if let Some(rec) = recover_stream(&vol, info, &vpath, stream, opts) {
+            if let Some(rec) = recover_stream(&vol, &info, &vpath, stream, opts) {
                 on_file(&rec);
                 out.push(rec);
             }
         }
-    }
+    });
     Ok(out)
 }
 
@@ -762,6 +834,27 @@ fn recover_stream(
     } else {
         format!("{vpath}~{}", stream.name)
     };
+
+    // A dry run is an inventory: names, sizes and timestamps. Hashing would
+    // mean reading every file on the volume -- on a 237 GB disk that is the
+    // whole disk, to answer a question about metadata.
+    if opts.dry_run {
+        let ext = std::path::Path::new(&info.name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| "bin".into());
+        return Some(FileRecord {
+            mft: info.num,
+            name: label,
+            ext,
+            size,
+            sha256: String::new(),
+            validated: !info.in_use,
+            deleted: !info.in_use,
+            path: String::new(),
+            timestamps: info.timestamps,
+        });
+    }
 
     let mut hasher = Sha256::new();
     let mut out_path = String::new();
@@ -894,20 +987,23 @@ pub fn extract(
     // Same two passes as `recover`: a compact path table, then one record at a
     // time. Holding every record's attributes cost gigabytes on a real volume.
     let mut infos: HashMap<u64, PathInfo> = HashMap::new();
-    for num in 0..vol.record_count {
-        if let Some(info) = parse_path_info(&vol, num) {
+    vol.for_each_record(|num, rec| {
+        if let Some(info) = parse_path_info(&vol, rec) {
             infos.insert(num, info);
         }
-    }
+    });
     let paths = build_paths(&infos);
     drop(infos);
     let mut out = Vec::new();
-    for num in 0..vol.record_count {
-        let Some(info) = parse_record(&vol, num) else {
-            continue;
+    // Collect the parsed records in one block-read sweep rather than
+    // fetching each by number: a per-record read costs a BitLocker
+    // decrypt and an EWF chunk decode, and there are over a million.
+    vol.for_each_record(|num, rec| {
+        let Some(info) = parse_record_bytes(&vol, num, rec) else {
+            return;
         };
         if info.base_record != 0 || info.is_dir || info.name.is_empty() {
-            continue;
+            return;
         }
         let info = &info;
         let vpath = paths.get(&num).cloned().unwrap_or_default();
@@ -940,7 +1036,7 @@ pub fn extract(
                 data,
             });
         }
-    }
+    });
     Ok(out)
 }
 

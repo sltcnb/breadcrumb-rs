@@ -2390,37 +2390,57 @@ fn run_ntfs(
     };
     let started = Instant::now();
     let quiet = opts.quiet;
-    let records = ntfs::recover(reader, base, &nopts, |rec| {
-        if machine {
-            println!(
-                "{}",
-                json::object(vec![
-                    ("event", json::string("file")),
-                    ("name", json::string(&rec.name)),
-                    ("mft", json::number(rec.mft)),
-                    ("size", json::number(rec.size)),
-                    ("sha256", json::string(&rec.sha256)),
-                    ("deleted", json::boolean(rec.deleted)),
-                    ("created", json::number(rec.timestamps.created)),
-                    ("modified", json::number(rec.timestamps.modified)),
-                    ("changed", json::number(rec.timestamps.changed)),
-                    ("accessed", json::number(rec.timestamps.accessed)),
-                    ("path", json::string(&rec.path)),
-                ])
-            );
-        } else if !quiet {
-            eprintln!(
-                "[+] {}  {} B{}",
-                rec.name,
-                rec.size,
-                if rec.validated {
-                    ""
-                } else {
-                    "  (low confidence)"
-                }
-            );
-        }
-    })?;
+    // The walk says where it is: a million-record MFT takes minutes, and
+    // silence for minutes is indistinguishable from a hang.
+    let mut last = Instant::now();
+    let records = ntfs::recover_reporting(
+        reader,
+        base,
+        &nopts,
+        |rec| {
+            if machine {
+                println!(
+                    "{}",
+                    json::object(vec![
+                        ("event", json::string("file")),
+                        ("name", json::string(&rec.name)),
+                        ("mft", json::number(rec.mft)),
+                        ("size", json::number(rec.size)),
+                        ("sha256", json::string(&rec.sha256)),
+                        ("deleted", json::boolean(rec.deleted)),
+                        ("created", json::number(rec.timestamps.created)),
+                        ("modified", json::number(rec.timestamps.modified)),
+                        ("changed", json::number(rec.timestamps.changed)),
+                        ("accessed", json::number(rec.timestamps.accessed)),
+                        ("path", json::string(&rec.path)),
+                    ])
+                );
+            } else if !quiet {
+                eprintln!(
+                    "[+] {}  {} B{}",
+                    rec.name,
+                    rec.size,
+                    if rec.validated {
+                        ""
+                    } else {
+                        "  (low confidence)"
+                    }
+                );
+            }
+        },
+        |done, total| {
+            if quiet || machine || last.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
+            last = Instant::now();
+            let pct = if total > 0 {
+                100.0 * done as f64 / total as f64
+            } else {
+                0.0
+            };
+            eprintln!("  MFT {done}/{total} ({pct:.0}%)");
+        },
+    )?;
     let elapsed = started.elapsed().as_secs_f64();
 
     // Manifest and CSV carry the timestamps, which is the point of this mode.
