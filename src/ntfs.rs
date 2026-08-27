@@ -14,6 +14,7 @@ use crate::artifacts;
 use crate::reader::Source;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 /// 1601-01-01 to 1970-01-01, in 100 ns units.
 const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
@@ -383,10 +384,6 @@ struct Info {
     base_record: u64,
     name: String,
     parent: Option<u64>,
-    /// This record's own sequence number, bumped every time NTFS reuses it.
-    seq: u64,
-    /// The sequence the file name claims its parent had.
-    parent_seq: u64,
     namespace: i32,
     timestamps: Timestamps,
     data: Vec<Stream>,
@@ -471,9 +468,6 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
         base_record: u64le(&rec, 32) & 0xFFFF_FFFF_FFFF,
         name: String::new(),
         parent: None,
-        // The record header carries the sequence number at offset 16.
-        seq: u16le(&rec, 16),
-        parent_seq: 0,
         namespace: -1,
         timestamps: Timestamps::default(),
         data: Vec::new(),
@@ -504,11 +498,7 @@ fn parse_record(vol: &Volume, num: u64) -> Option<Info> {
                         .map(|p| u16::from_le_bytes([p[0], p[1]]))
                         .filter_map(|u| char::from_u32(u as u32))
                         .collect();
-                    let reference = u64le(c, 0);
-                    info.parent = Some(reference & 0xFFFF_FFFF_FFFF);
-                    // The top 16 bits say which incarnation of the parent this
-                    // name belonged to.
-                    info.parent_seq = reference >> 48;
+                    info.parent = Some(u64le(c, 0) & 0xFFFF_FFFF_FFFF);
                     info.namespace = namespace;
                 }
             }
@@ -554,13 +544,75 @@ fn sanitize(name: &str) -> String {
 }
 
 /// Reconstruct each record's path by walking parent references to the root.
-fn build_paths(infos: &HashMap<u64, Info>) -> HashMap<u64, String> {
+/// What rebuilding a path needs, and nothing else.
+///
+/// The MFT of a working Windows volume holds well over a million records. Held
+/// as full `Info` values -- names, timestamps, and a `Vec<Stream>` per file --
+/// that is gigabytes, and three volumes walked at once exhausted a 36 GB
+/// machine. This is about eighty bytes a record instead, so the table stays in
+/// the low hundreds of megabytes and each record's streams are dropped as soon
+/// as the file is written.
+struct PathInfo {
+    name: String,
+    parent: Option<u64>,
+    parent_seq: u64,
+    seq: u64,
+}
+
+/// First pass: read only what paths are made of.
+fn parse_path_info(vol: &Volume, num: u64) -> Option<PathInfo> {
+    let rec = vol.record(num)?;
+    // Extension records describe another record's attributes.
+    if u64le(&rec, 32) & 0xFFFF_FFFF_FFFF != 0 {
+        return None;
+    }
+    let mut best: Option<(i32, String, u64, u64)> = None;
+    for attr in vol.attributes(&rec) {
+        if attr.atype != 0x30 || !attr.resident || attr.content.len() < 66 {
+            continue;
+        }
+        let c = &attr.content;
+        let namelen = c[64] as usize;
+        let namespace = c[65] as i32;
+        if c.len() < 66 + namelen * 2 {
+            continue;
+        }
+        // Prefer a Win32/POSIX name over the DOS 8.3 alias.
+        let better = match &best {
+            None => true,
+            Some((ns, _, _, _)) => *ns == 2 && namespace != 2,
+        };
+        if better {
+            let name: String = c[66..66 + namelen * 2]
+                .chunks(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .filter_map(|u| char::from_u32(u as u32))
+                .collect();
+            let reference = u64le(c, 0);
+            best = Some((
+                namespace,
+                name,
+                reference & 0xFFFF_FFFF_FFFF,
+                reference >> 48,
+            ));
+        }
+    }
+    let (_, name, parent, parent_seq) = best?;
+    Some(PathInfo {
+        name,
+        parent: Some(parent),
+        parent_seq,
+        seq: u16le(&rec, 16),
+    })
+}
+
+fn build_paths(infos: &HashMap<u64, PathInfo>) -> HashMap<u64, String> {
     let mut cache: HashMap<u64, String> = HashMap::new();
     cache.insert(5, String::new()); // record 5 is the root directory
     fn walk(
         num: u64,
         depth: u32,
-        infos: &HashMap<u64, Info>,
+        infos: &HashMap<u64, PathInfo>,
         cache: &mut HashMap<u64, String>,
     ) -> String {
         if let Some(p) = cache.get(&num) {
@@ -622,26 +674,27 @@ pub fn recover(
     mut on_file: impl FnMut(&FileRecord),
 ) -> Result<Vec<FileRecord>, String> {
     let vol = Volume::open(src, base)?;
-    let mut infos: HashMap<u64, Info> = HashMap::new();
+    // Pass one: the path table, which is small. Pass two re-reads each record
+    // and lets it go again, so a million-record volume no longer has to fit in
+    // memory all at once.
+    let mut infos: HashMap<u64, PathInfo> = HashMap::new();
     for num in 0..vol.record_count {
-        if let Some(info) = parse_record(&vol, num) {
-            // Extension records describe attributes of another record; the base
-            // record is the one that owns the file.
-            if info.base_record == 0 {
-                infos.insert(num, info);
-            }
+        if let Some(info) = parse_path_info(&vol, num) {
+            infos.insert(num, info);
         }
     }
     let paths = build_paths(&infos);
+    drop(infos);
     let mut out = Vec::new();
-    let mut nums: Vec<u64> = infos.keys().copied().collect();
-    nums.sort_unstable();
 
-    for num in nums {
-        let info = &infos[&num];
-        if info.is_dir || info.data.is_empty() || info.name.is_empty() {
+    for num in 0..vol.record_count {
+        let Some(info) = parse_record(&vol, num) else {
+            continue;
+        };
+        if info.base_record != 0 || info.is_dir || info.data.is_empty() || info.name.is_empty() {
             continue;
         }
+        let info = &info;
         if info.in_use && !opts.include_live {
             continue;
         }
@@ -665,12 +718,22 @@ fn recover_stream(
 ) -> Option<FileRecord> {
     let flags = stream.flags;
     let mut validated = true;
-    let data: Vec<u8>;
-    let size: u64;
 
-    if stream.resident {
-        data = stream.content.clone();
-        size = data.len() as u64;
+    // Resident data lives in the record itself and is at most a kilobyte or so.
+    // Everything else is written a block at a time: reading a stream into
+    // memory first meant $BadClus:$Bad -- a sparse stream as large as the whole
+    // volume -- asking for 236 GB of allocation, which killed the process with
+    // no message on a real examination.
+    let size = if stream.resident {
+        stream.content.len() as u64
+    } else {
+        stream.real_size
+    };
+    if size < opts.min_size.max(1) {
+        return None;
+    }
+    let runs: &[Run] = if stream.resident {
+        &[]
     } else {
         let runs = stream.runs.as_deref()?;
         // Compressed (0x0001) or encrypted (0x4000) streams: the raw clusters
@@ -678,7 +741,11 @@ fn recover_stream(
         if flags & 0x4001 != 0 {
             return None;
         }
-        size = stream.real_size;
+        // Entirely sparse: there is nothing on the disk to recover, only a
+        // declared length. $BadClus is exactly this on a healthy volume.
+        if runs.iter().all(|&(lcn, _)| lcn.is_none()) {
+            return None;
+        }
         // A run pointing outside the volume means the runlist is not this
         // file's any more.
         if !runs.iter().all(|&(lcn, cnt)| match lcn {
@@ -687,24 +754,18 @@ fn recover_stream(
         }) {
             return None;
         }
-        let mut got = vol.read_runs(runs, size);
-        if (got.len() as u64) < size {
-            got.resize(size as usize, 0); // volume edge: pad and flag it
-            validated = false;
-        }
-        data = got;
-    }
-    if size < opts.min_size.max(1) {
-        return None;
-    }
+        runs
+    };
 
     let label = if stream.name.is_empty() {
         vpath.to_string()
     } else {
         format!("{vpath}~{}", stream.name)
     };
-    let sha256 = format!("{:x}", Sha256::digest(&data));
+
+    let mut hasher = Sha256::new();
     let mut out_path = String::new();
+    let mut file = None;
     if !opts.dry_run {
         let rel = label.trim_start_matches('/');
         let mut p = std::path::PathBuf::from(&opts.out_dir)
@@ -720,9 +781,75 @@ fn recover_stream(
             let fname = format!("{stem}_mft{}{}", info.num, ext.unwrap_or_default());
             p = p.with_file_name(fname);
         }
-        std::fs::write(&p, &data).ok()?;
+        file = Some(std::io::BufWriter::new(std::fs::File::create(&p).ok()?));
         out_path = p.to_string_lossy().to_string();
     }
+
+    let mut written = 0u64;
+    let mut emit = |chunk: &[u8]| -> bool {
+        hasher.update(chunk);
+        match file.as_mut() {
+            Some(f) => f.write_all(chunk).is_ok(),
+            None => true,
+        }
+    };
+    if stream.resident {
+        if !emit(&stream.content) {
+            return None;
+        }
+    } else {
+        const BLOCK: u64 = 8 << 20;
+        let zeros = vec![0u8; BLOCK as usize];
+        'runs: for &(lcn, count) in runs {
+            let mut left = count.saturating_mul(vol.cluster).min(size - written);
+            let mut at = lcn.map(|l| vol.base + l * vol.cluster);
+            while left > 0 {
+                let want = left.min(BLOCK);
+                let ok = match at {
+                    // A sparse run inside a real file is a hole: zeros belong
+                    // there, and they cost nothing to write.
+                    None => emit(&zeros[..want as usize]),
+                    Some(pos) => {
+                        let blk = vol.src.pread(pos, want as usize);
+                        if blk.is_empty() {
+                            validated = false;
+                            break 'runs;
+                        }
+                        at = Some(pos + blk.len() as u64);
+                        let n = blk.len() as u64;
+                        let ok = emit(&blk);
+                        left -= n.min(left);
+                        written += n;
+                        if !ok {
+                            return None;
+                        }
+                        continue;
+                    }
+                };
+                if !ok {
+                    return None;
+                }
+                left -= want;
+                written += want;
+            }
+        }
+        if written < size {
+            // Volume edge, or a short read: pad and say the file is not whole.
+            validated = false;
+            let mut left = size - written;
+            while left > 0 {
+                let want = left.min(BLOCK);
+                if !emit(&vec![0u8; want as usize]) {
+                    return None;
+                }
+                left -= want;
+            }
+        }
+    }
+    if let Some(mut f) = file {
+        f.flush().ok()?;
+    }
+
     let ext = std::path::Path::new(&info.name)
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -733,7 +860,7 @@ fn recover_stream(
         name: label,
         ext,
         size,
-        sha256,
+        sha256: format!("{:x}", hasher.finalize()),
         validated: validated && !info.in_use,
         deleted: !info.in_use,
         path: out_path,
@@ -764,23 +891,25 @@ pub fn extract(
     cap: usize,
 ) -> Result<Vec<Extracted>, String> {
     let vol = Volume::open(src, base)?;
-    let mut infos: HashMap<u64, Info> = HashMap::new();
+    // Same two passes as `recover`: a compact path table, then one record at a
+    // time. Holding every record's attributes cost gigabytes on a real volume.
+    let mut infos: HashMap<u64, PathInfo> = HashMap::new();
     for num in 0..vol.record_count {
-        if let Some(info) = parse_record(&vol, num) {
-            if info.base_record == 0 {
-                infos.insert(num, info);
-            }
+        if let Some(info) = parse_path_info(&vol, num) {
+            infos.insert(num, info);
         }
     }
     let paths = build_paths(&infos);
-    let mut nums: Vec<u64> = infos.keys().copied().collect();
-    nums.sort_unstable();
+    drop(infos);
     let mut out = Vec::new();
-    for num in nums {
-        let info = &infos[&num];
-        if info.is_dir || info.name.is_empty() {
+    for num in 0..vol.record_count {
+        let Some(info) = parse_record(&vol, num) else {
+            continue;
+        };
+        if info.base_record != 0 || info.is_dir || info.name.is_empty() {
             continue;
         }
+        let info = &info;
         let vpath = paths.get(&num).cloned().unwrap_or_default();
         for stream in &info.data {
             if !want(&vpath.to_lowercase(), &stream.name) {
