@@ -938,3 +938,37 @@ fn a_pdf_ends_where_its_own_startxref_says_it_does() {
     );
     assert!(pdf_rec.validated);
 }
+
+#[test]
+fn a_compound_file_whose_streams_run_past_its_end_is_not_carved() {
+    // A compound file is a filesystem in a file. A carve that stops short
+    // leaves the header and the directory intact and the content gone: the
+    // names read, the structure parses, and nothing opens. On a live scan this
+    // produced three carves of exactly 8 MiB -- the size of a fallback guess,
+    // not of a document -- plus a .msi, a .xls and a .msg with most of their
+    // streams pointing past their own last byte.
+    let dir = Tmp::new("ole-troncature");
+    let data = builders::make_ole_truncated("WordDocument");
+    let mut blob = vec![0u8; 1024];
+    blob.extend_from_slice(&data);
+    let path = write_tmp(&dir, "ole.bin", &blob);
+    let src = Source::open(path.to_str().unwrap()).unwrap();
+    let mut w = Window::new(&src, 1024, blob.len() as u64 - 1024);
+    assert!(
+        handlers::carve_ole(&mut w).is_none(),
+        "a compound file missing its own content was carved anyway"
+    );
+
+    // The same builder without the tampering still carves: the check rejects
+    // truncation, not compound files.
+    let good = builders::make_ole("WordDocument");
+    let mut blob2 = vec![0u8; 1024];
+    blob2.extend_from_slice(&good);
+    let path2 = write_tmp(&dir, "ole-ok.bin", &blob2);
+    let src2 = Source::open(path2.to_str().unwrap()).unwrap();
+    let mut w2 = Window::new(&src2, 1024, blob2.len() as u64 - 1024);
+    assert!(
+        handlers::carve_ole(&mut w2).is_some(),
+        "a sound compound file was refused"
+    );
+}

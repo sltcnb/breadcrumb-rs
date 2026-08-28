@@ -578,3 +578,14 @@ pub fn all() -> Vec<(&'static str, Vec<u8>)> {
         ("exe", make_pe(false)),
     ]
 }
+
+/// A compound file whose directory declares a stream far larger than the data
+/// actually present: what a carve that stopped short looks like on disk.
+pub fn make_ole_truncated(stream_name: &str) -> Vec<u8> {
+    let mut d = make_ole(stream_name);
+    // Second directory entry, size field: claim a megabyte of content.
+    let dir = 512 * 2; // header, FAT, then the directory sector
+    let size_at = dir + 128 + 120;
+    d[size_at..size_at + 8].copy_from_slice(&(1u64 << 20).to_le_bytes());
+    d
+}

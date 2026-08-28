@@ -538,6 +538,64 @@ fn utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
+/// Does every stream the directory declares end inside the carve?
+///
+/// A compound file is a filesystem in a file: the directory names streams, the
+/// allocation table chains their sectors. A carve that stops short leaves both
+/// intact and the data gone -- the header parses, the names read, and the
+/// document will not open. Following each chain is the only test that catches
+/// it, and it is not fooled by an installer's encoded stream names.
+fn ole_streams_fit(w: &mut Window, fat: &[u64], sector: u64, dir_sect: u64, end: u64) -> bool {
+    const MINI_CUTOFF: u64 = 4096;
+    let sectors = end / sector;
+    let mut cur = dir_sect;
+    let mut visited = 0u64;
+    while cur < FREESECT - 5 && cur < sectors && visited < sectors {
+        visited += 1;
+        let Some(blk) = w.exact((cur + 1) * sector, sector as usize) else {
+            return false;
+        };
+        for k in 0..(sector as usize / 128) {
+            let e = k * 128;
+            let kind = blk[e + 66];
+            // 2 is a stream; storages and the root hold no sector chain of
+            // their own that a reader would follow for content.
+            if kind != 2 {
+                continue;
+            }
+            let start = u32le(&blk, e + 116);
+            let size = u64le(&blk, e + 120);
+            if size < MINI_CUTOFF {
+                continue; // lives in the mini stream, covered by the root chain
+            }
+            if size > end {
+                return false;
+            }
+            let want = size.div_ceil(sector);
+            let mut s = start;
+            let mut hops = 0u64;
+            while hops < want {
+                if s as usize >= fat.len() || s >= sectors {
+                    return false;
+                }
+                s = fat[s as usize];
+                hops += 1;
+                if s >= FREESECT - 5 {
+                    break;
+                }
+            }
+            if hops < want {
+                return false;
+            }
+        }
+        cur = match fat.get(cur as usize) {
+            Some(v) => *v,
+            None => return false,
+        };
+    }
+    true
+}
+
 pub fn carve_ole(w: &mut Window) -> Option<Carve> {
     let h = w.exact(0, 512)?;
     let shift = u16le(&h, 30);
@@ -562,7 +620,10 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
         return None;
     }
 
-    let fallback = |w: &Window| carve(w.limit.min(8 << 20), "ole", false);
+    // No fallback. When the allocation table cannot be read, the end of the
+    // file is unknown -- and a fixed-size guess is not a file. On a live scan
+    // that guess produced three carves of exactly 8 MiB whose streams pointed
+    // past their own last byte: structurally plausible, unopenable.
 
     // FAT sector locations: 109 header DIFAT entries, then the DIFAT chain.
     let mut fat_sectors: Vec<u64> = Vec::new();
@@ -585,10 +646,7 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
         && !seen.contains(&dif_sect)
     {
         seen.push(dif_sect);
-        let blk = match w.exact((dif_sect + 1) * sector, sector as usize) {
-            Some(b) => b,
-            None => return fallback(w),
-        };
+        let blk = w.exact((dif_sect + 1) * sector, sector as usize)?;
         for i in 0..per_sector - 1 {
             let v = u32le(&blk, i * 4);
             if v != FREESECT {
@@ -599,30 +657,34 @@ pub fn carve_ole(w: &mut Window) -> Option<Carve> {
         hops += 1;
     }
     if fat_sectors.is_empty() {
-        return fallback(w);
+        return None;
     }
 
+    // Keep the table itself, not just its high-water mark: the end of the file
+    // is one question, whether every stream fits inside it is another, and only
+    // the second one says the carve is a file someone can open.
+    let mut fat: Vec<u64> = Vec::new();
     let mut max_used: i64 = -1;
-    let mut idx_base: i64 = 0;
     for fs in fat_sectors {
-        let blk = match w.exact((fs + 1) * sector, sector as usize) {
-            Some(b) => b,
-            None => return fallback(w),
-        };
+        let blk = w.exact((fs + 1) * sector, sector as usize)?;
         for i in 0..per_sector {
-            if u32le(&blk, i * 4) != FREESECT {
-                max_used = max_used.max(idx_base + i as i64);
+            let v = u32le(&blk, i * 4);
+            if v != FREESECT {
+                max_used = max_used.max(fat.len() as i64);
             }
+            fat.push(v);
         }
-        idx_base += per_sector as i64;
     }
     if max_used < 0 {
-        return fallback(w);
+        return None;
     }
     // the header occupies "sector -1"
     let end = (max_used as u64).saturating_add(2).saturating_mul(sector);
     if end > w.limit {
-        return fallback(w);
+        return None;
+    }
+    if !ole_streams_fit(w, &fat, sector, dir_sect, end) {
+        return None;
     }
     // The root directory entry names the application outright; stream names are
     // the fallback for containers that leave the CLSID zeroed.
